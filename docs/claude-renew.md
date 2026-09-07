@@ -72,9 +72,11 @@ Accounts: `default` | `benjr` | `bggai`.
   daemon re-checks at fire time (10-min retries, max 8).
 - The **continue** message tells the session its limit reset and to resume the
   pending task; it runs under the session's own model and permission mode.
-- The **follow-up** (default reset + 5 h 10 m) is a bare "hi" that wakes the
-  session again purely to anchor the next window. `--follow-up off` if you'll
-  be awake by then anyway.
+- The **follow-up** (default reset + 5 h 10 m) anchors the next window as a
+  **separate throwaway `claude -p --model haiku` ping** on the account — it
+  never touches the working session, which stays on its own model
+  (changed 2026-09-07; previously it messaged the session). `--follow-up off`
+  if you'll be awake by then anyway.
 - **Daemon:** plain detached process, ticks every 30 s, retries when the account
   is still limited or the session isn't visible, exits when nothing is pending.
   Tasks expire after `--ttl` (24 h default). Survives closing the terminal, not

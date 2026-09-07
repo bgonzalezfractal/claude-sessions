@@ -58,7 +58,10 @@ ACCOUNTS = discover_accounts()
 
 DEFAULT_CONTINUE = ("Your usage limit has reset (scheduled auto-continue). "
                     "Please continue with the pending task exactly where you left off.")
-DEFAULT_FOLLOWUP = "hi (scheduled window anchor — just reply 'hi', nothing else)"
+# The follow-up is a window anchor only: it runs as a SEPARATE throwaway
+# `claude -p --model haiku` ping on the account (like the morning job), never
+# touching the working session — which runs on its own (expensive) model.
+DEFAULT_FOLLOWUP = "Hello, only answer hello"
 
 TICK_SECONDS = 30
 RETRY_MINUTES = 10
@@ -295,6 +298,28 @@ def run_helper(account, cwd, prompt_text, timeout=300):
 
 def fire(entry, action):
     account, name, path = entry["account"], entry["session"], entry.get("path")
+    if action["kind"] == "follow-up":
+        # Anchor ping: a separate haiku one-shot on the account. Any request
+        # opens the window; the working session (on its own model) is left alone.
+        cmd = [CLAUDE_BIN, "-p", "--model", "haiku"]
+        try:
+            r = subprocess.run(cmd, input=action["message"], text=True,
+                               env=account_env(account),
+                               cwd=path if path and os.path.isdir(path) else HOME,
+                               capture_output=True, timeout=240)
+            out = ((r.stdout or "") + (r.stderr or "")).strip()
+        except subprocess.TimeoutExpired:
+            _reschedule(action, "anchor ping timed out")
+            return
+        if re.search(r"hit your session limit", out, re.I):
+            _reschedule(action, f"{account} still limited")
+        elif r.returncode == 0:
+            action["done"] = True
+            log(f"FIRED follow-up (haiku anchor ping) -> {account}: "
+                f"{out[-120:].replace(chr(10), ' ')}")
+        else:
+            _reschedule(action, f"anchor ping failed: {out[-150:]}")
+        return
     live = find_live_sessions(account, name, path)
     if len(live) > 1:
         log(f"warning: {len(live)} live sessions named {name!r} — messaging by "
