@@ -208,11 +208,24 @@ if [ -f "$SRC/history.jsonl" ]; then
   if [ "$DRY" = "--dry-run" ]; then
     echo "      would append $N entries"
   else
-    touch "$DST/history.jsonl"
-    grep "\"$SID\"" "$SRC/history.jsonl" | while IFS= read -r l; do
-      grep -qxF "$l" "$DST/history.jsonl" || printf '%s\n' "$l" >> "$DST/history.jsonl"
-    done
-    echo "      appended up to $N entries"
+    # Dedup in python: `grep -qxF "$huge_line"` can exhaust memory on
+    # multi-MB pasted-content entries (hit 2026-09-07).
+    python3 - "$SRC/history.jsonl" "$DST/history.jsonl" "$SID" <<'PY'
+import hashlib, sys
+src, dst, sid = sys.argv[1:4]
+h = lambda l: hashlib.sha1(l.encode()).digest()
+try:
+    have = {h(l) for l in open(dst, errors="replace")}
+except FileNotFoundError:
+    have = set()
+n = 0
+with open(dst, "a") as out:
+    for l in open(src, errors="replace"):
+        if sid in l and h(l) not in have:
+            out.write(l if l.endswith("\n") else l + "\n")
+            n += 1
+print(f"      appended {n} entries")
+PY
   fi
 fi
 
