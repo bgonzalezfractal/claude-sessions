@@ -92,6 +92,16 @@ sha *and* mtime unchanged — **does not write `.claude.json`**. The usual "neve
 run a second Claude process against a config dir that has a live session, they
 clobber `.claude.json`" rule therefore does not apply to this one command.
 
+## TUI fallback (when the API rate-limits)
+
+If the usage endpoint answers 429, claude-status automatically drives a
+headless interactive `claude` through `/status` → → (Usage tab) in a pty and
+parses the rendered panel — the TUI has its own data path and keeps working
+while the endpoint is throttled (verified live 2026-09-07). Rows are marked
+`↺ via interactive /status`. Costs ~15 s per account, spawns (and SIGKILLs) a
+scratch session, and shows only what the TUI shows: session + weekly bars with
+humanized reset times, no weekly-Fable split.
+
 ## Troubleshooting
 
 - **`✗ … refresh did not renew it`** → the automatic refresh could not renew that

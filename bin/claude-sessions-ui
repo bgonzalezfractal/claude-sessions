@@ -338,12 +338,12 @@ function fmtReset(iso){if(!iso)return"";const d=new Date(iso),n=new Date();
   return"resets "+(d.toDateString()===n.toDateString()?"":d.toLocaleDateString([],{weekday:"short"})+" ")+t}
 function limLabel(l){if(l.kind==="session")return"session (5h)";
   if(l.kind==="weekly_all")return"weekly";
-  return"weekly "+(((l.scope||{}).model||{}).display_name||l.kind)}
+  return"weekly "+(((l.scope||{}).model||{}).display_name||(l.kind==="weekly_scoped"?"Fable":l.kind))}
 function limRow(l){return`<div class="lim"><span class="lab">${limLabel(l)}</span>
   <span class="bar"><i style="width:${Math.min(100,l.percent||0)}%;
   background:${barColor(l.percent||0,l.kind)}"></i></span>
   <span class="pct">${l.percent??"?"}%</span>
-  <span class="rst">${fmtReset(l.resets_at)}</span></div>`}
+  <span class="rst">${l.resets_at?fmtReset(l.resets_at):esc(l.reset_text||"")}</span></div>`}
 function sessOf(l){return(l||[]).find(x=>x.kind==="session")||{}}
 
 let USAGE={},USAGE_AT=null;

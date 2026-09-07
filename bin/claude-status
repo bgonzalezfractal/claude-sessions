@@ -20,7 +20,7 @@ Resilience (added 2026-09-06, after a run failed on two of three accounts):
     the CLI, so two processes never race on one .claude.json.
 """
 
-import argparse, glob, hashlib, json, os, subprocess, sys, time
+import argparse, glob, hashlib, json, os, pty, re, select, signal, subprocess, sys, time
 import urllib.error, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -132,6 +132,84 @@ def refresh_token(cfg_dir, suffix_dir):
     return "claude auth status"
 
 
+# --------------------------------------------------- TUI fallback (no API) ---
+# The interactive /status Usage tab keeps working even when the oauth/usage
+# endpoint is rate-limited (verified 2026-09-07 during a 429 episode): the TUI
+# has its own data path. So when the API throttles us, we drive a headless
+# `claude` through /status -> right -> right in a pty and parse the panel.
+TUI_KINDS = {"session": "session",
+             "week (all models)": "weekly_all",
+             "week (Fable)": "weekly_scoped"}
+
+
+def _live_cwd(cfg_dir):
+    """A trusted cwd for this account: any live session's, else $HOME."""
+    for f in glob.glob(os.path.join(cfg_dir, "sessions", "*.json")):
+        try:
+            j = json.load(open(f))
+            os.kill(j["pid"], 0)
+            if os.path.isdir(j.get("cwd") or ""):
+                return j["cwd"]
+        except Exception:
+            pass
+    return os.path.expanduser("~")
+
+
+def tui_status(cfg_dir, suffix_dir, boot_wait=10):
+    """-> list of {kind, percent, reset_text} parsed from the /status Usage tab,
+    or None. Spawns a real interactive claude; killed with SIGKILL so it never
+    writes config on exit."""
+    env = dict(os.environ)
+    env.pop("CLAUDE_CONFIG_DIR", None)
+    if suffix_dir is not None:
+        env["CLAUDE_CONFIG_DIR"] = suffix_dir
+    cwd = _live_cwd(cfg_dir)
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.chdir(cwd)
+        os.execve("/opt/homebrew/bin/claude", ["claude"], env)
+
+    def drain(t):
+        out = b""
+        end = time.time() + t
+        while time.time() < end:
+            r, _, _ = select.select([fd], [], [], 0.3)
+            if r:
+                try:
+                    out += os.read(fd, 65536)
+                except OSError:
+                    break
+        return out
+
+    try:
+        buf = drain(boot_wait)
+        os.write(fd, b"/status\r")
+        buf += drain(3)
+        os.write(fd, b"\x1b[C")          # right arrow -> second tab
+        buf += drain(1.2)
+        os.write(fd, b"\x1b[C")          # right arrow -> Usage
+        buf += drain(4)
+    finally:
+        try:
+            os.kill(pid, signal.SIGKILL)
+            os.close(fd)
+        except OSError:
+            pass
+
+    text = re.sub(rb"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|[\r\n]",
+                  b"", buf).decode(errors="replace")
+    found = {}
+    for m in re.finditer(
+            r"Current (session|week \(all models\)|week \(Fable\))"
+            r"[^%]{0,400}?(\d{1,3})%\s*used\s*Resets\s*([^(]{1,50}?)\s*\(",
+            text):
+        found[TUI_KINDS[m.group(1)]] = {          # last redraw wins
+            "kind": TUI_KINDS[m.group(1)],
+            "percent": int(m.group(2)),
+            "reset_text": "resets " + m.group(3).strip()}
+    return list(found.values()) or None
+
+
 # ------------------------------------------------------------------- fetch ---
 def _get(token):
     req = urllib.request.Request(
@@ -182,10 +260,15 @@ def collect(account):
         usage, retries = fetch_usage(payload["accessToken"])
     except urllib.error.HTTPError as e:
         if e.code == 429:
-            wait = e.headers.get("retry-after") if e.headers else None
-            hint = f"retry in {wait}s" if wait else "wait a few minutes"
-            return label, email, [f"  {YEL}✗ rate-limited (429) — too many "
-                                  f"status checks; {hint}{RST}"], False
+            rows = tui_status(cfg_dir, suffix_dir)
+            if rows:
+                lines = render_rows(rows)
+                lines.append(f"  {DIM}↺ via interactive /status "
+                             f"(usage API rate-limited){RST}")
+                return label, email, lines, True
+            return label, email, [f"  {YEL}✗ rate-limited (429) and the "
+                                  f"/status fallback failed — wait a few "
+                                  f"minutes{RST}"], False
         if e.code not in (401, 403):
             return label, email, [f"  {RED}✗ HTTP {e.code}{RST}"], False
         # Token was rejected: refresh once (unless we already did) and retry.
@@ -207,13 +290,7 @@ def collect(account):
     if healed and "refreshed token" not in notes:
         notes.append("refreshed token")
 
-    lines = []
-    for l in usage.get("limits", []):
-        pct = l.get("percent") or 0
-        active = f" {RED}◀ LIMITED{RST}" if l.get("is_active") and pct >= 100 else ""
-        base = CYN if l["kind"] == "session" else GRN
-        lines.append(f"  {limit_label(l):<14} {bar(pct, base=base)} {pct:>3}%  "
-                     f"{DIM}{fmt_reset(l.get('resets_at'))}{RST}{active}")
+    lines = render_rows(usage.get("limits", []))
     if not lines:
         lines.append(f"  {DIM}(no limits reported){RST}")
     extra = usage.get("extra_usage") or {}
@@ -249,7 +326,22 @@ def limit_label(l):
     if l["kind"] == "weekly_all":
         return "weekly"
     scope = ((l.get("scope") or {}).get("model") or {}).get("display_name")
-    return f"weekly {scope}" if scope else l["kind"]
+    return f"weekly {scope}" if scope else "weekly Fable" \
+        if l["kind"] == "weekly_scoped" else l["kind"]
+
+
+def render_rows(rows):
+    """Bar lines from either API limits (resets_at) or TUI rows (reset_text)."""
+    lines = []
+    for l in rows:
+        pct = l.get("percent") or 0
+        active = f" {RED}◀ LIMITED{RST}" if l.get("is_active") and pct >= 100 else ""
+        base = CYN if l["kind"] == "session" else GRN
+        when = fmt_reset(l.get("resets_at")) if l.get("resets_at") \
+            else l.get("reset_text", "")
+        lines.append(f"  {limit_label(l):<14} {bar(pct, base=base)} {pct:>3}%  "
+                     f"{DIM}{when}{RST}{active}")
+    return lines
 
 
 def main():
@@ -277,7 +369,14 @@ def main():
                 usage, _ = fetch_usage(payload["accessToken"])
                 out[label] = {"email": get_email(cfg_dir), **usage}
             except Exception as e:
-                out[label] = {"error": str(e)}; failed = True
+                rows = None
+                if isinstance(e, urllib.error.HTTPError) and e.code == 429:
+                    rows = tui_status(cfg_dir, suffix_dir)
+                if rows:
+                    out[label] = {"email": get_email(cfg_dir), "limits": rows,
+                                  "source": "tui"}
+                else:
+                    out[label] = {"error": str(e)}; failed = True
         print(json.dumps(out, indent=2))
         return 1 if failed else 0
 
