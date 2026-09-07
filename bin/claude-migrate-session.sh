@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+# Copy a Claude Code session (transcript + all sidecar state) from one config dir
+# (alias/account) to another, keeping the same session id so it can be resumed.
+#
+#   claude-migrate-session.sh <src-config-dir> <dst-config-dir> <session-id> [--dry-run]
+#
+# Docs, gotchas and verification steps: ./session_migration.md
+#
+# Example:
+#   claude-migrate-session.sh ~/.claude ~/.claude-bggai 2fcc8337-04b2-432a-814a-4bbe66c6c630
+set -euo pipefail
+
+SRC="${1:?src config dir, e.g. ~/.claude}"
+DST="${2:?dst config dir, e.g. ~/.claude-bggai}"
+SID="${3:?session id (uuid)}"
+DRY="${4:-}"
+RS=(rsync -a)
+[ "$DRY" = "--dry-run" ] && RS=(rsync -a --dry-run -v) && echo "*** DRY RUN ***"
+
+SRC="${SRC%/}"; DST="${DST%/}"
+[ -d "$SRC" ] || { echo "no such src: $SRC" >&2; exit 1; }
+[ -d "$DST" ] || { echo "no such dst: $DST" >&2; exit 1; }
+
+# ---- resolve the real config json for each dir ------------------------------
+# The default account (no CLAUDE_CONFIG_DIR) keeps its config at ~/.claude.json;
+# aliased dirs keep it at <dir>/.claude.json. For ~/.claude, ~/.claude.json is
+# always the live file — a <dir>/.claude.json there is a stale copy (seeded by a
+# past migration) that plain `claude` never reads.
+pick_json() {
+  local dir="$1" a="$1/.claude.json" b="$HOME/.claude.json"
+  if [ "$dir" = "$HOME/.claude" ] && [ -f "$b" ]; then
+    echo "$b"
+  else
+    echo "$a"
+  fi
+}
+SRC_JSON="$(pick_json "$SRC")"
+DST_JSON="$(pick_json "$DST")"
+
+# ---- locate the transcript ---------------------------------------------------
+TRANSCRIPT="$(find "$SRC/projects" -maxdepth 2 -name "$SID.jsonl" -print -quit)"
+[ -n "$TRANSCRIPT" ] || { echo "session $SID not found under $SRC/projects" >&2; exit 1; }
+PROJ_DIR="$(dirname "$TRANSCRIPT")"
+PROJ_KEY="$(basename "$PROJ_DIR")"
+# A re-homed session (gotcha #5) carries several cwds; the first one is stale.
+# Prefer the cwd whose slug matches <project-key>, else the most recent one.
+CWD="$(python3 - "$TRANSCRIPT" "$PROJ_KEY" <<'PY'
+import json,re,sys
+slug=lambda w: re.sub(r"[^A-Za-z0-9]", "-", w)
+key=sys.argv[2]; last=""; match=""
+for line in open(sys.argv[1]):
+    try: d=json.loads(line)
+    except Exception: continue
+    w=d.get("cwd")
+    if not w: continue
+    last=w
+    if not match and slug(w)==key: match=w
+print(match or last)
+PY
+)"
+TITLE="$(python3 - "$TRANSCRIPT" <<'PY'
+import json,sys
+t=""
+for line in open(sys.argv[1]):
+    try: d=json.loads(line)
+    except Exception: continue
+    if d.get("type")=="custom-title": t=d.get("customTitle","")
+    elif d.get("type")=="ai-title" and not t: t=d.get("aiTitle","")
+print(t)
+PY
+)"
+echo "session : $SID  ($TITLE)"
+echo "project : $PROJ_KEY"
+echo "cwd     : $CWD"
+echo "src->dst: $SRC -> $DST"
+echo "config  : $SRC_JSON -> $DST_JSON"
+echo
+
+# ---- guard: warn if a live process still holds this session ------------------
+# (gotcha #3 in session_migration.md: a copy is a fork; exit the source first)
+for sj in "$SRC"/sessions/*.json "$DST"/sessions/*.json; do
+  [ -f "$sj" ] || continue
+  if grep -q "\"sessionId\":\"$SID\"" "$sj" 2>/dev/null; then
+    PID="$(python3 -c "import json;print(json.load(open('$sj')).get('pid',''))" 2>/dev/null)"
+    if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+      echo "!! session $SID is OPEN in a live process (pid $PID, $sj)"
+      echo "!! exit that session before/right after copying, or the copies will diverge."
+      echo
+    fi
+  fi
+done
+
+# ---- 0. guard: don't silently clobber an existing copy -----------------------
+DST_T="$DST/projects/$PROJ_KEY/$SID.jsonl"
+if [ -f "$DST_T" ] && [ "$DRY" != "--dry-run" ]; then
+  STAMP="$(date +%Y%m%d-%H%M)"
+  echo "[0/6] dst copy exists -> backing up as *.bak-$STAMP"
+  cp -p "$DST_T" "$DST_T.bak-$STAMP"
+  [ -d "$DST/projects/$PROJ_KEY/$SID" ] && cp -Rp "$DST/projects/$PROJ_KEY/$SID" "$DST/projects/$PROJ_KEY/$SID.bak-$STAMP"
+fi
+
+# ---- 1. transcript + per-session sidecar (subagents/, workflows/, tool-results/)
+mkdir -p "$DST/projects/$PROJ_KEY"
+echo "[1/6] transcript + sidecar dirs"
+"${RS[@]}" "$TRANSCRIPT" "$DST/projects/$PROJ_KEY/"
+[ -d "$PROJ_DIR/$SID" ] && "${RS[@]}" "$PROJ_DIR/$SID/" "$DST/projects/$PROJ_KEY/$SID/"
+
+# ---- 2. project memory (MEMORY.md + memory files) ---------------------------
+# ADDITIVE: the destination account has its own memory for this project. Never
+# overwrite a memory file that already exists there (its MEMORY.md index is
+# usually the richer one) — copy only the new files and merge the index lines.
+if [ -d "$PROJ_DIR/memory" ]; then
+  echo "[2/6] project memory ($(ls "$PROJ_DIR/memory" | wc -l | tr -d ' ') files, additive)"
+  mkdir -p "$DST/projects/$PROJ_KEY/memory"
+  "${RS[@]}" --ignore-existing "$PROJ_DIR/memory/" "$DST/projects/$PROJ_KEY/memory/"
+  if [ "$DRY" = "--dry-run" ]; then
+    echo "      would merge MEMORY.md pointer lines"
+  else
+    python3 - "$PROJ_DIR/memory" "$DST/projects/$PROJ_KEY/memory" <<'PY'
+import os,re,shutil,sys
+src,dst=sys.argv[1:3]
+si,di=os.path.join(src,"MEMORY.md"),os.path.join(dst,"MEMORY.md")
+if not os.path.exists(si): sys.exit(0)
+if not os.path.exists(di):
+    shutil.copy2(si,di); print("      MEMORY.md: copied (dst had none)"); sys.exit(0)
+d=open(di).read()
+link=re.compile(r"\]\(([^)]+\.md)\)")
+have={m.group(1) for m in link.finditer(d)}
+new=[l.rstrip("\n") for l in open(si)
+     if l.lstrip().startswith("- ") and (m:=link.search(l)) and m.group(1) not in have]
+if not new:
+    print("      MEMORY.md: no new pointers"); sys.exit(0)
+shutil.copy2(di,di+".bak")
+with open(di,"a") as f:
+    f.write("\n## Merged from the migrated session\n"+"\n".join(new)+"\n")
+print("      MEMORY.md: appended %d pointer(s)"%len(new))
+PY
+  fi
+else
+  echo "[2/6] project memory: none"
+fi
+
+# ---- 3. per-session state dirs ----------------------------------------------
+echo "[3/6] tasks / file-history / session-env"
+for d in tasks file-history session-env; do
+  if [ -d "$SRC/$d/$SID" ]; then
+    mkdir -p "$DST/$d/$SID"
+    "${RS[@]}" "$SRC/$d/$SID/" "$DST/$d/$SID/"
+    # a running source session leaves a .lock behind; it is meaningless in the copy
+    [ "$DRY" = "--dry-run" ] || rm -f "$DST/$d/$SID/.lock"
+    echo "      + $d/$SID"
+  fi
+done
+
+# ---- 4. prompt history for this session -------------------------------------
+echo "[4/6] history.jsonl entries"
+if [ -f "$SRC/history.jsonl" ]; then
+  N=$(grep -c "\"$SID\"" "$SRC/history.jsonl" || true)
+  if [ "$DRY" = "--dry-run" ]; then
+    echo "      would append $N entries"
+  else
+    touch "$DST/history.jsonl"
+    grep "\"$SID\"" "$SRC/history.jsonl" | while IFS= read -r l; do
+      grep -qxF "$l" "$DST/history.jsonl" || printf '%s\n' "$l" >> "$DST/history.jsonl"
+    done
+    echo "      appended up to $N entries"
+  fi
+fi
+
+# ---- 5. .claude.json project entry (trust, allowedTools, mcp, ignorePatterns)
+echo "[5/6] .claude.json project entry"
+if [ "$DRY" != "--dry-run" ]; then
+  python3 - "$SRC_JSON" "$DST_JSON" "$CWD" <<'PY'
+import json,sys,os,shutil
+src,dst,cwd=sys.argv[1:4]
+if not (os.path.exists(src) and os.path.exists(dst)): sys.exit(0)
+s=json.load(open(src)); d=json.load(open(dst))
+sp=s.get("projects",{}).get(cwd)
+if not sp: print("      no src project entry for",cwd); sys.exit(0)
+KEEP=["allowedTools","mcpContextUris","mcpServers","enabledMcpjsonServers",
+      "disabledMcpjsonServers","disabledMcpServers","hasTrustDialogAccepted",
+      "ignorePatterns","hasClaudeMdExternalIncludesApproved","exampleFiles",
+      "exampleFilesGeneratedAt","projectOnboardingSeenCount"]
+tgt=d.setdefault("projects",{}).setdefault(cwd,{})
+added=[]
+for k in KEEP:
+    if k in sp and k not in tgt:
+        tgt[k]=sp[k]; added.append(k)
+shutil.copy2(dst,dst+".bak")
+json.dump(d,open(dst,"w"),indent=2)
+print("      merged keys:", ", ".join(added) or "(nothing new)")
+PY
+else
+  echo "      (skipped in dry run)"
+fi
+
+# ---- 6. done -----------------------------------------------------------------
+echo "[6/6] done"
+echo
+echo "Resume with:"
+if [ "$DST" = "$HOME/.claude" ]; then
+  echo "  cd $CWD && claude --resume $SID"
+else
+  echo "  cd $CWD && CLAUDE_CONFIG_DIR=$DST claude --resume $SID"
+fi

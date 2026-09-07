@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""
+claude-copy-session — migrate a session between accounts, quickly, by NAME.
+
+A thin front-end over claude-migrate-session.sh (bundled next to this script;
+see docs/session-migration.md for what gets copied and the gotchas). You give
+aliases and the session's /rename title instead of config dirs and uuids:
+
+    claude-copy-session bggai default radal-v2            # copy + print resume line
+    claude-copy-session bggai default radal-v2 --dry-run
+    claude-copy-session --list bggai [--json]              # sessions on an account
+
+Reminders baked in (from session_migration.md):
+  * a copy is a FORK — exit the source session first or they diverge;
+  * turn off auto-compact on the destination before resuming a big transcript;
+  * resume from the cwd the script prints.
+"""
+
+import argparse, glob, json, os, re, subprocess, sys
+
+HOME = os.path.expanduser("~")
+MIGRATE = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                       "claude-migrate-session.sh")
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def discover_accounts():
+    accounts = {"default": os.path.join(HOME, ".claude")}
+    for d in sorted(glob.glob(os.path.join(HOME, ".claude-*"))):
+        if os.path.isfile(os.path.join(d, ".claude.json")):
+            accounts[os.path.basename(d)[len(".claude-"):]] = d
+    return accounts
+
+
+def sessions_on(cfg_dir):
+    """All known sessions: {sid: {title, project, cwd, live, mtime}}."""
+    out = {}
+    for f in glob.glob(os.path.join(cfg_dir, "projects", "*", "*", "custom-title.json")):
+        sid_dir = os.path.dirname(f)
+        sid = os.path.basename(sid_dir)
+        if not UUID_RE.match(sid):
+            continue  # .bak-stamped copies etc.
+        try:
+            title = json.load(open(f)).get("customTitle", "").strip('"')
+        except Exception:
+            continue
+        t = os.path.join(os.path.dirname(sid_dir), sid + ".jsonl")
+        out[sid] = {"title": title,
+                    "project": os.path.basename(os.path.dirname(sid_dir)),
+                    "live": False, "pid": None, "cwd": None,
+                    "mtime": os.path.getmtime(t) if os.path.exists(t) else 0}
+    for f in glob.glob(os.path.join(cfg_dir, "sessions", "*.json")):
+        try:
+            j = json.load(open(f))
+            os.kill(j["pid"], 0)
+        except Exception:
+            continue
+        sid = j.get("sessionId")
+        rec = out.setdefault(sid, {"title": j.get("name", ""), "project": "",
+                                   "mtime": 0})
+        rec.update(live=True, pid=j["pid"], cwd=j.get("cwd"),
+                   title=j.get("name") or rec.get("title", ""))
+    return out
+
+
+def resolve(cfg_dir, ref):
+    if UUID_RE.match(ref):
+        return ref
+    hits = {sid: s for sid, s in sessions_on(cfg_dir).items()
+            if s.get("title") == ref}
+    if not hits:
+        sys.exit(f"no session titled {ref!r} on that account — "
+                 f"try `claude-copy-session --list <alias>`")
+    if len(hits) > 1:
+        # newest transcript wins, but say so
+        sid = max(hits, key=lambda k: hits[k]["mtime"])
+        print(f"note: {len(hits)} sessions titled {ref!r}; using the most recent "
+              f"({sid}). Others: "
+              + ", ".join(k for k in hits if k != sid), file=sys.stderr)
+        return sid
+    return next(iter(hits))
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="claude-copy-session",
+        description="Copy a session between accounts by alias + session title.")
+    ap.add_argument("--list", metavar="ALIAS", help="list sessions on an account")
+    ap.add_argument("--json", action="store_true", help="with --list: JSON output")
+    ap.add_argument("src", nargs="?", help="source account alias")
+    ap.add_argument("dst", nargs="?", help="destination account alias")
+    ap.add_argument("session", nargs="?", help="session title (or uuid)")
+    ap.add_argument("--dry-run", action="store_true")
+    a = ap.parse_args()
+    accounts = discover_accounts()
+
+    if a.list:
+        if a.list not in accounts:
+            sys.exit(f"unknown alias {a.list!r} — one of: {', '.join(accounts)}")
+        sess = sessions_on(accounts[a.list])
+        rows = sorted(sess.items(), key=lambda kv: -kv[1]["mtime"])
+        if a.json:
+            print(json.dumps([{"sid": k, **v} for k, v in rows], indent=1))
+        else:
+            for sid, s in rows:
+                mark = "LIVE " if s["live"] else "     "
+                print(f"{mark}{s.get('title') or '(untitled)':<28} {sid}  "
+                      f"{s.get('project', '')}")
+        return
+
+    if not (a.src and a.dst and a.session):
+        ap.error("need: <src-alias> <dst-alias> <session-title-or-uuid> "
+                 "(or --list <alias>)")
+    for alias in (a.src, a.dst):
+        if alias not in accounts:
+            sys.exit(f"unknown alias {alias!r} — one of: {', '.join(accounts)}")
+    if a.src == a.dst:
+        sys.exit("src and dst are the same account")
+
+    sid = resolve(accounts[a.src], a.session)
+    cmd = [MIGRATE, accounts[a.src], accounts[a.dst], sid]
+    if a.dry_run:
+        cmd.append("--dry-run")
+    r = subprocess.run(cmd)
+    if r.returncode == 0 and not a.dry_run:
+        print("\nReminders: exit the source session (a copy is a fork); "
+              "consider \"autoCompactEnabled\": false on the destination "
+              "before resuming a large transcript.")
+    sys.exit(r.returncode)
+
+
+if __name__ == "__main__":
+    main()

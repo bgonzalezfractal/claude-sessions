@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+"""
+claude-sessions-ui — localhost dashboard for the claude-sessions toolkit.
+
+    claude-sessions-ui [--port 8788] [--no-open]
+
+One page, five panels:
+  * Accounts & usage  — every account's session/weekly/weekly-Fable bars
+  * Live sessions     — per account, with one-click "renew" scheduling
+  * Renew queue       — pending claude-renew tasks, cancel buttons
+  * Copy session      — migrate a session between accounts (dry-run supported)
+  * New account       — scaffold an alias (login stays manual)
+
+Python stdlib only. Binds 127.0.0.1. Action history is kept in SQLite at
+~/.claude/claude-sessions-ui.db (table `events`); all real work is delegated
+to the sibling CLIs (claude-status, claude-renew, claude-copy-session,
+claude-account) so there is a single implementation of every behavior.
+"""
+
+import argparse, json, os, sqlite3, subprocess, sys, webbrowser
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+HOME = os.path.expanduser("~")
+BIN = os.path.dirname(os.path.realpath(__file__))
+DB = os.path.join(HOME, ".claude", "claude-sessions-ui.db")
+RENEW_REGISTRY = os.path.join(HOME, ".claude", "claude-renew", "registry.json")
+RENEW_PID = os.path.join(HOME, ".claude", "claude-renew", "daemon.pid")
+
+
+# ------------------------------------------------------------------ storage ---
+def db():
+    c = sqlite3.connect(DB)
+    c.execute("""CREATE TABLE IF NOT EXISTS events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL, kind TEXT NOT NULL, ok INTEGER NOT NULL,
+        detail TEXT NOT NULL, output TEXT)""")
+    return c
+
+
+def log_event(kind, ok, detail, output=""):
+    with db() as c:
+        c.execute("INSERT INTO events (ts, kind, ok, detail, output) VALUES (?,?,?,?,?)",
+                  (datetime.now().isoformat(timespec="seconds"), kind,
+                   1 if ok else 0, detail, output[-4000:]))
+
+
+def recent_events(n=40):
+    with db() as c:
+        rows = c.execute("SELECT ts, kind, ok, detail FROM events "
+                         "ORDER BY id DESC LIMIT ?", (n,)).fetchall()
+    return [{"ts": t, "kind": k, "ok": bool(o), "detail": d} for t, k, o, d in rows]
+
+
+# ---------------------------------------------------------------- cli bridge ---
+def run_cli(tool, *args, timeout=90):
+    r = subprocess.run([os.path.join(BIN, tool), *args],
+                       capture_output=True, text=True, timeout=timeout)
+    return r.returncode == 0, (r.stdout or "") + (r.stderr or "")
+
+
+def cli_json(tool, *args, timeout=90):
+    ok, out = run_cli(tool, *args, timeout=timeout)
+    if not ok:
+        return None
+    try:
+        return json.loads(out)
+    except Exception:
+        return None
+
+
+def overview():
+    accounts = cli_json("claude-account", "list", "--json") or []
+    usage = cli_json("claude-status", "--json", timeout=120) or {}
+    sessions = {}
+    for a in accounts:
+        if a.get("logged_in"):
+            sessions[a["alias"]] = [s for s in
+                (cli_json("claude-copy-session", "--list", a["alias"], "--json") or [])]
+    try:
+        renew = json.load(open(RENEW_REGISTRY))
+    except Exception:
+        renew = []
+    daemon = False
+    try:
+        os.kill(int(open(RENEW_PID).read().strip()), 0)
+        daemon = True
+    except Exception:
+        pass
+    return {"accounts": accounts, "usage": usage, "sessions": sessions,
+            "renew": renew, "renew_daemon": daemon, "events": recent_events(),
+            "now": datetime.now().isoformat(timespec="seconds")}
+
+
+ACTIONS = {
+    "renew_add": lambda p: run_cli(
+        "claude-renew", "add", p["account"], p["session"],
+        *(["--path", p["path"]] if p.get("path") else []),
+        *(["--reset", p["reset"]] if p.get("reset") else []),
+        *(["--delay", str(p["delay"])] if p.get("delay") else []),
+        *(["--follow-up", p["follow_up"]] if p.get("follow_up") else [])),
+    "renew_remove": lambda p: run_cli(
+        "claude-renew", "remove", p["session"],
+        *(["--account", p["account"]] if p.get("account") else [])),
+    "copy": lambda p: run_cli(
+        "claude-copy-session", p["src"], p["dst"], p["session"],
+        *(["--dry-run"] if p.get("dry_run") else []), timeout=300),
+    "account_add": lambda p: run_cli("claude-account", "add", p["alias"]),
+}
+
+
+# --------------------------------------------------------------------- http ---
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a):  # quiet
+        pass
+
+    def _send(self, code, body, ctype="application/json"):
+        data = body if isinstance(body, bytes) else json.dumps(body).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        if self.path == "/":
+            self._send(200, PAGE.encode(), "text/html; charset=utf-8")
+        elif self.path == "/api/overview":
+            self._send(200, overview())
+        else:
+            self._send(404, {"error": "not found"})
+
+    def do_POST(self):
+        name = self.path.rsplit("/", 1)[-1]
+        fn = ACTIONS.get(name)
+        if not fn:
+            self._send(404, {"error": "unknown action"})
+            return
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            payload = json.loads(self.rfile.read(n) or b"{}")
+            ok, out = fn(payload)
+        except Exception as e:
+            ok, out = False, str(e)
+        log_event(name, ok, json.dumps(payload, ensure_ascii=False), out)
+        self._send(200 if ok else 500, {"ok": ok, "output": out})
+
+
+PAGE = r"""<!doctype html><html><head><meta charset="utf-8">
+<title>claude-sessions</title>
+<style>
+:root{--bg:#0a0a0a;--panel:#111;--line:#222;--fg:#e8e8e8;--dim:#888;
+      --pink:#E5188E;--grn:#3ddc84;--yel:#ffc107;--red:#ff4d4d;--cyn:#4dd0e1}
+*{box-sizing:border-box;margin:0}
+body{background:var(--bg);color:var(--fg);font:13px/1.5 "SF Mono",Menlo,monospace;padding:24px}
+h1{font-size:15px;letter-spacing:.12em;text-transform:uppercase;margin-bottom:2px}
+h1 b{color:var(--pink)}
+#now{color:var(--dim);font-size:11px;margin-bottom:20px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:14px}
+.panel{background:var(--panel);border:1px solid var(--line);padding:14px 16px}
+.panel h2{font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--dim);
+  border-bottom:1px solid var(--line);padding-bottom:8px;margin-bottom:10px}
+.acct{margin-bottom:12px}
+.acct .name{color:var(--pink);font-weight:700}
+.acct .email{color:var(--dim);font-size:11px}
+.lim{display:flex;align-items:center;gap:8px;margin:2px 0}
+.lim .lab{width:96px;color:var(--dim);font-size:11px}
+.bar{flex:1;height:8px;background:#1a1a1a;border:1px solid var(--line)}
+.bar i{display:block;height:100%}
+.lim .pct{width:38px;text-align:right}
+.lim .rst{width:110px;color:var(--dim);font-size:11px;text-align:right}
+.sess{display:flex;justify-content:space-between;gap:6px;padding:3px 0;border-bottom:1px dashed #1b1b1b}
+.sess .t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sess .live{color:var(--grn)}
+button{background:transparent;border:1px solid var(--pink);color:var(--pink);
+  font:inherit;font-size:11px;padding:2px 10px;cursor:pointer}
+button:hover{background:var(--pink);color:#000}
+button.dim{border-color:var(--line);color:var(--dim)}
+select,input{background:#0e0e0e;border:1px solid var(--line);color:var(--fg);
+  font:inherit;padding:4px 6px;margin:2px 0;width:100%}
+label{color:var(--dim);font-size:11px;display:block;margin-top:6px}
+.row{display:flex;gap:8px}.row>*{flex:1}
+.ev{padding:2px 0;border-bottom:1px dashed #1b1b1b;font-size:11px}
+.ev .ok{color:var(--grn)}.ev .fail{color:var(--red)}.ev .ts{color:var(--dim)}
+#toast{position:fixed;bottom:18px;right:18px;max-width:440px;background:#161616;
+  border:1px solid var(--pink);padding:10px 14px;white-space:pre-wrap;display:none;font-size:11px}
+.renew-task{padding:5px 0;border-bottom:1px dashed #1b1b1b}
+.renew-task .k{color:var(--cyn)}
+.muted{color:var(--dim)}
+</style></head><body>
+<h1>claude-<b>sessions</b></h1>
+<div id="now">loading…</div>
+<div class="grid">
+  <div class="panel" style="grid-column:1/-1"><h2>Accounts &amp; usage</h2><div id="accounts"></div></div>
+  <div class="panel"><h2>Live sessions</h2><div id="sessions"></div></div>
+  <div class="panel"><h2>Renew queue <span id="daemon"></span></h2><div id="renew"></div>
+    <label>account</label><select id="r_acct"></select>
+    <label>session (live)</label><select id="r_sess"></select>
+    <div class="row"><div><label>reset (auto / 5:40am)</label><input id="r_reset" placeholder="auto"></div>
+    <div><label>follow-up (+5h5m / 10:50am / off)</label><input id="r_fu" placeholder="+5h5m"></div></div>
+    <button style="margin-top:8px" onclick="renewAdd()">schedule renew</button></div>
+  <div class="panel"><h2>Copy session</h2>
+    <div class="row"><div><label>from</label><select id="c_src"></select></div>
+    <div><label>to</label><select id="c_dst"></select></div></div>
+    <label>session</label><select id="c_sess"></select>
+    <div class="row" style="margin-top:8px">
+      <button class="dim" onclick="copySess(true)">dry-run</button>
+      <button onclick="copySess(false)">copy</button></div></div>
+  <div class="panel"><h2>New account</h2>
+    <label>alias (a-z0-9-)</label><input id="a_name" placeholder="e.g. work">
+    <button style="margin-top:8px" onclick="acctAdd()">scaffold account</button>
+    <p class="muted" style="margin-top:8px">Creates ~/.claude-&lt;alias&gt; + the shell
+    alias. Then run it in a terminal and /login — it auto-joins every tool.</p></div>
+  <div class="panel"><h2>Activity</h2><div id="events"></div></div>
+</div>
+<div id="toast"></div>
+<script>
+let O=null;
+const $=id=>document.getElementById(id);
+const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+function toast(t,ms=6000){const e=$("toast");e.textContent=t;e.style.display="block";
+  clearTimeout(e._t);e._t=setTimeout(()=>e.style.display="none",ms)}
+function barColor(p,kind){if(p>=85)return"var(--red)";if(p>=60)return"var(--yel)";
+  return kind==="session"?"var(--cyn)":"var(--grn)"}
+function fmtReset(iso){if(!iso)return"";const d=new Date(iso),n=new Date();
+  const t=d.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"});
+  return"resets "+(d.toDateString()===n.toDateString()?"":d.toLocaleDateString([],{weekday:"short"})+" ")+t}
+function limLabel(l){if(l.kind==="session")return"session (5h)";
+  if(l.kind==="weekly_all")return"weekly";
+  return"weekly "+((l.scope||{}).model||{}).display_name||l.kind}
+async function refresh(){
+  try{O=await(await fetch("/api/overview")).json()}catch(e){toast("overview failed: "+e);return}
+  $("now").textContent=O.now;
+  $("accounts").innerHTML=O.accounts.map(a=>{
+    const u=O.usage[a.alias]||{};
+    const lims=(u.limits||[]).map(l=>`<div class="lim"><span class="lab">${limLabel(l)}</span>
+      <span class="bar"><i style="width:${Math.min(100,l.percent||0)}%;
+      background:${barColor(l.percent||0,l.kind)}"></i></span>
+      <span class="pct">${l.percent??"?"}%</span>
+      <span class="rst">${fmtReset(l.resets_at)}</span></div>`).join("");
+    const state=a.logged_in?esc(a.email):'<span style="color:var(--red)">not logged in</span>';
+    return`<div class="acct"><span class="name">${esc(a.alias)}</span>
+      <span class="email"> ${state} · ${a.live_sessions} live</span>
+      ${lims||(u.error?`<div class="muted">✗ ${esc(u.error)}</div>`:"")}</div>`}).join("");
+  $("sessions").innerHTML=Object.entries(O.sessions).map(([acct,list])=>
+    list.filter(s=>s.live).map(s=>`<div class="sess">
+      <span class="t"><span class="live">●</span> ${esc(s.title||"(untitled)")}
+      <span class="muted">· ${esc(acct)} · ${esc((s.cwd||"").replace(/^\/Users\/[^/]+/,"~"))}</span></span>
+      <button class="dim" onclick="quickRenew('${esc(acct)}','${esc(s.title)}')">renew</button>
+      </div>`).join("")).join("")||'<span class="muted">no live sessions</span>';
+  $("daemon").textContent=O.renew_daemon?"· daemon ✓":"· daemon off";
+  $("renew").innerHTML=O.renew.map(e=>{
+    const acts=e.actions.map(x=>`${x.kind} @ ${x.at.slice(5,16).replace("T"," ")}${x.done?" ✓":""}`).join(" · ");
+    return`<div class="renew-task"><span class="k">${esc(e.account)}/${esc(e.session)}</span>
+      <button class="dim" style="float:right"
+        onclick="renewRemove('${esc(e.session)}','${esc(e.account)}')">cancel</button>
+      <div class="muted">${acts}</div></div>`}).join("")||'<div class="muted">queue empty</div>';
+  const acctOpts=O.accounts.filter(a=>a.logged_in).map(a=>`<option>${esc(a.alias)}</option>`).join("");
+  for(const id of["r_acct","c_src","c_dst"]){const el=$(id),v=el.value;el.innerHTML=acctOpts;if(v)el.value=v}
+  fillSess();$("events").innerHTML=O.events.map(e=>`<div class="ev">
+    <span class="${e.ok?"ok":"fail"}">${e.ok?"✓":"✗"}</span>
+    <span class="ts">${e.ts.slice(5,16).replace("T"," ")}</span>
+    ${esc(e.kind)} <span class="muted">${esc(e.detail.slice(0,90))}</span></div>`).join("")
+    ||'<span class="muted">nothing yet</span>';
+}
+function fillSess(){
+  const rl=(O.sessions[$("r_acct").value]||[]).filter(s=>s.live);
+  $("r_sess").innerHTML=rl.map(s=>`<option>${esc(s.title)}</option>`).join("");
+  const cl=O.sessions[$("c_src").value]||[];
+  $("c_sess").innerHTML=cl.map(s=>`<option value="${esc(s.sid)}">${esc(s.title||s.sid)}
+    ${s.live?"(LIVE)":""}</option>`).join("");
+}
+$("r_acct")?.addEventListener("change",fillSess);
+document.addEventListener("change",e=>{if(e.target.id==="c_src")fillSess()});
+async function post(action,payload){
+  toast("running "+action+"…",60000);
+  const r=await(await fetch("/api/"+action,{method:"POST",body:JSON.stringify(payload)})).json();
+  toast((r.ok?"✓ ":"✗ ")+action+"\n"+r.output.slice(-1200));refresh();return r}
+function renewAdd(){post("renew_add",{account:$("r_acct").value,session:$("r_sess").value,
+  reset:$("r_reset").value||"auto",follow_up:$("r_fu").value||"+5h5m"})}
+function quickRenew(acct,sess){post("renew_add",{account:acct,session:sess})}
+function renewRemove(s,a){post("renew_remove",{session:s,account:a})}
+function copySess(dry){post("copy",{src:$("c_src").value,dst:$("c_dst").value,
+  session:$("c_sess").value,dry_run:dry})}
+function acctAdd(){const n=$("a_name").value.trim();if(n)post("account_add",{alias:n})}
+refresh();setInterval(refresh,60000);
+</script></body></html>"""
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="claude-sessions-ui")
+    ap.add_argument("--port", type=int, default=8788)
+    ap.add_argument("--no-open", action="store_true")
+    a = ap.parse_args()
+    srv = ThreadingHTTPServer(("127.0.0.1", a.port), Handler)
+    url = f"http://127.0.0.1:{a.port}"
+    print(f"claude-sessions-ui on {url}  (Ctrl-C to stop; events -> {DB})")
+    if not a.no_open:
+        webbrowser.open(url)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\nbye")
+
+
+if __name__ == "__main__":
+    main()

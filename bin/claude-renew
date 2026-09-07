@@ -32,7 +32,7 @@ Mechanics (validated live 2026-09-06):
     no window anchored.
 """
 
-import argparse, hashlib, json, os, re, subprocess, sys, time
+import argparse, glob, hashlib, json, os, re, subprocess, sys, time
 import urllib.error, urllib.request
 from datetime import datetime, timedelta, timezone
 
@@ -44,11 +44,17 @@ LOG = os.path.join(BASE, "renew.log")
 CLAUDE_BIN = "/opt/homebrew/bin/claude"
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 
-ACCOUNTS = {
-    "default": None,  # None => no CLAUDE_CONFIG_DIR (default-account keychain gotcha)
-    "benjr": os.path.join(HOME, ".claude-benjr"),
-    "bggai": os.path.join(HOME, ".claude-bggai"),
-}
+def discover_accounts():
+    """default + every logged-in ~/.claude-* dir. Value None => run without
+    CLAUDE_CONFIG_DIR (the default-account keychain gotcha)."""
+    accounts = {"default": None}
+    for d in sorted(glob.glob(os.path.join(HOME, ".claude-*"))):
+        if os.path.isfile(os.path.join(d, ".claude.json")):
+            accounts[os.path.basename(d)[len(".claude-"):]] = d
+    return accounts
+
+
+ACCOUNTS = discover_accounts()
 
 DEFAULT_CONTINUE = ("Your usage limit has reset (scheduled auto-continue). "
                     "Please continue with the pending task exactly where you left off.")

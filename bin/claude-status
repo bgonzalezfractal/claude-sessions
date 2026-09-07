@@ -20,16 +20,26 @@ Resilience (added 2026-09-06, after a run failed on two of three accounts):
     the CLI, so two processes never race on one .claude.json.
 """
 
-import argparse, hashlib, json, os, subprocess, sys, time
+import argparse, glob, hashlib, json, os, subprocess, sys, time
 import urllib.error, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
-ACCOUNTS = [
-    ("default", "/Users/bgg/.claude", None),
-    ("benjr",   "/Users/bgg/.claude-benjr", "/Users/bgg/.claude-benjr"),
-    ("bggai",   "/Users/bgg/.claude-bggai", "/Users/bgg/.claude-bggai"),
-]
+HOME = os.path.expanduser("~")
+
+
+def discover_accounts():
+    """default + every ~/.claude-* dir that has logged in (has .claude.json).
+    Tuple shape: (label, config_dir, suffix_dir) — suffix_dir None => plain
+    keychain service and no CLAUDE_CONFIG_DIR (the default-account gotcha)."""
+    accounts = [("default", os.path.join(HOME, ".claude"), None)]
+    for d in sorted(glob.glob(os.path.join(HOME, ".claude-*"))):
+        if os.path.isfile(os.path.join(d, ".claude.json")):
+            accounts.append((os.path.basename(d)[len(".claude-"):], d, d))
+    return accounts
+
+
+ACCOUNTS = discover_accounts()
 
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 RETRY_CODES = {408, 425, 429, 500, 502, 503, 504}
@@ -83,8 +93,14 @@ def human_delta(secs):
 
 # ------------------------------------------------------------------- state ---
 def get_email(cfg_dir):
+    # The default account's live config is ~/.claude.json, NOT ~/.claude/.claude.json
+    # (that one can be a stale migration artifact) — see docs/session-migration.md.
+    path = (os.path.join(HOME, ".claude.json")
+            if cfg_dir == os.path.join(HOME, ".claude")
+            and os.path.isfile(os.path.join(HOME, ".claude.json"))
+            else cfg_dir + "/.claude.json")
     try:
-        j = json.load(open(cfg_dir + "/.claude.json"))
+        j = json.load(open(path))
         return (j.get("oauthAccount") or {}).get("emailAddress", "?")
     except Exception:
         return "?"
