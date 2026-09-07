@@ -71,9 +71,12 @@ def cli_json(tool, *args, timeout=90):
         return None
 
 
-def overview():
+def overview(with_usage=False):
     accounts = cli_json("claude-account", "list", "--json") or []
-    usage = cli_json("claude-status", "--json", timeout=120) or {}
+    # The usage endpoint rate-limits frequent checks (429) — it is only called
+    # when the user explicitly asks (?usage=1), never on an automatic refresh.
+    usage = (cli_json("claude-status", "--json", timeout=120) or {}) \
+        if with_usage else None
     sessions = {}
     for a in accounts:
         if a.get("logged_in"):
@@ -131,7 +134,8 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/":
             self._send(200, PAGE.encode(), "text/html; charset=utf-8")
         elif url.path == "/api/overview":
-            self._send(200, overview())
+            q = urllib.parse.parse_qs(url.query)
+            self._send(200, overview(q.get("usage", ["0"])[0] == "1"))
         elif url.path == "/api/reset":
             acct = urllib.parse.parse_qs(url.query).get("account", [""])[0]
             self._send(200, cli_json("claude-renew", "detect", acct, "--json")
@@ -232,6 +236,8 @@ th{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.1em}
   <a href="#copy" data-v="copy">Copy</a>
   <a href="#accounts" data-v="accounts">Accounts</a>
   <a href="#activity" data-v="activity">Activity</a>
+  <div style="padding:16px 20px"><button class="dim refresh-btn"
+    onclick="refresh(true)">↻ refresh usage</button></div>
 </nav>
 <main>
 <div class="view" id="v-home">
@@ -242,7 +248,9 @@ th{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.1em}
 </div>
 
 <div class="view" id="v-usage">
-  <h1>Usage</h1><div class="sub">session · weekly · weekly-Fable — read-only, refreshed every 60 s</div>
+  <h1>Usage</h1><div class="sub">session · weekly · weekly-Fable — read-only.
+  Fetched only when you ask: the endpoint rate-limits frequent checks.
+  <button class="dim refresh-btn" onclick="refresh(true)">↻ refresh usage</button></div>
   <div id="u-accounts"></div>
 </div>
 
@@ -338,9 +346,16 @@ function limRow(l){return`<div class="lim"><span class="lab">${limLabel(l)}</spa
   <span class="rst">${fmtReset(l.resets_at)}</span></div>`}
 function sessOf(l){return(l||[]).find(x=>x.kind==="session")||{}}
 
-async function refresh(){
-  try{O=await(await fetch("/api/overview")).json()}catch(e){toast("refresh failed: "+e);return}
-  $("now").textContent=O.now;
+let USAGE={},USAGE_AT=null;
+async function refresh(withUsage=false){
+  const btns=document.querySelectorAll(".refresh-btn");
+  btns.forEach(b=>b.textContent="↻ …");
+  try{O=await(await fetch("/api/overview?usage="+(withUsage?1:0))).json()}
+  catch(e){toast("refresh failed: "+e);btns.forEach(b=>b.textContent="↻ refresh usage");return}
+  if(O.usage){USAGE=O.usage;USAGE_AT=O.now}
+  O.usage=USAGE;
+  btns.forEach(b=>b.textContent="↻ refresh usage");
+  $("now").textContent=O.now+(USAGE_AT?`  ·  usage as of ${USAGE_AT}`:"  ·  usage not fetched yet — hit refresh");
   const pend=O.renew.reduce((n,e)=>n+e.actions.filter(a=>!a.done).length,0);
   const liveN=Object.values(O.sessions).reduce((n,l)=>n+l.filter(s=>s.live).length,0);
   $("h-stats").innerHTML=`
@@ -354,7 +369,7 @@ async function refresh(){
     return`<div class="card"><span class="aname">${esc(a.alias)}</span>
       <span class="muted small"> ${a.logged_in?esc(a.email):"not logged in"}
       · ${a.live_sessions} live</span>
-      ${u.limits?limRow(s):`<div class="muted small">✗ ${esc(u.error||"no data")}</div>`}
+      ${u.limits?limRow(s):`<div class="muted small">${esc(u.error?"✗ "+u.error:"usage not fetched — ↻ refresh")}</div>`}
       <div class="muted small">${(u.limits||[]).filter(l=>l.kind!=="session")
         .map(l=>`${limLabel(l)} ${l.percent}%`).join(" · ")}</div></div>`}).join("");
   const queue=O.renew.map(e=>{
@@ -371,7 +386,7 @@ async function refresh(){
     const u=O.usage[a.alias]||{};
     return`<div class="card"><span class="aname">${esc(a.alias)}</span>
       <span class="muted small"> ${a.logged_in?esc(a.email):"not logged in"}</span>
-      ${(u.limits||[]).map(limRow).join("")||`<div class="muted small">✗ ${esc(u.error||"no data")}</div>`}
+      ${(u.limits||[]).map(limRow).join("")||`<div class="muted small">${esc(u.error?"✗ "+u.error:"usage not fetched — ↻ refresh")}</div>`}
       </div>`}).join("");
   $("s-list").innerHTML=Object.entries(O.sessions).map(([acct,list])=>
     list.filter(s=>s.live).map(s=>`<div class="list-item">
@@ -445,7 +460,9 @@ function copySess(dry){post("copy",{src:$("c_src").value,dst:$("c_dst").value,
   session:$("c_sess").value,src_path:$("c_src_path").value||null,
   dst_path:$("c_dst_path").value||null,dry_run:dry})}
 function acctAdd(){const n=$("a_name").value.trim();if(n)post("account_add",{alias:n})}
-nav();refresh();setInterval(refresh,60000);
+// Manual refresh only — no polling. Opening the page loads the cheap local
+// state (accounts, sessions, queue, events); usage is fetched on demand.
+nav();refresh(false);
 </script></body></html>"""
 
 

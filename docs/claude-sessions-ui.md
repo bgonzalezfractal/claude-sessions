@@ -12,7 +12,11 @@ claude-sessions-ui --port 9000 --no-open
 - **Home** — at-a-glance: per-account session bar + next reset, live count,
   pending renews, daemon state.
 - **Usage** — every account with its session (cyan) / weekly /
-  weekly-Fable bars, percentages, reset times; refreshed every 60 s.
+  weekly-Fable bars, percentages, reset times. **Refresh is manual** (the
+  "↻ refresh usage" button): the usage endpoint rate-limits frequent checks
+  (429), so nothing polls it — opening the page and every action refresh only
+  the cheap local state (accounts, sessions, queue, events), and the last
+  fetched usage stays cached with an "as of" timestamp.
 - **Live sessions** — per account with cwd; a one-click **renew** button
   schedules the default auto-continue for that session.
 - **Renew queue** — pending `claude-renew` tasks with fire times, done marks,
@@ -49,7 +53,7 @@ sqlite3 ~/.claude/claude-sessions-ui.db "SELECT ts,kind,ok,detail FROM events OR
 
 | Endpoint | Payload |
 |----------|---------|
-| `GET /api/overview` | — (accounts, usage, sessions, renew queue, events) |
+| `GET /api/overview[?usage=1]` | accounts, sessions, queue, events; `usage=1` also calls the usage endpoint |
 | `GET /api/reset?account=X` | detected session reset time for the renew form |
 | `POST /api/renew_add` | `{account, session, path?, reset?, delay? (0-30/5), follow_up?}` |
 | `POST /api/renew_remove` | `{session, account?}` |

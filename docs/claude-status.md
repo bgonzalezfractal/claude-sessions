@@ -31,7 +31,9 @@ renders the Usage tab from **`GET https://api.anthropic.com/api/oauth/usage`**
 `anthropic-version: 2023-06-01`). The script calls that endpoint directly, once per
 account. It is **read-only**: costs nothing, consumes no tokens, and — unlike any
 `claude -p` ping — does **not** anchor or start a 5-hour usage window. Safe to run
-at any hour, any number of times.
+at any hour — but not in a tight loop: the endpoint rate-limits frequent
+checks with 429 (a 429 is reported with its retry-after and deliberately NOT
+retried; hammering a rate limit extends it).
 
 Tokens come from the CLI's own macOS keychain entries:
 

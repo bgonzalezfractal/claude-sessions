@@ -42,7 +42,10 @@ def discover_accounts():
 ACCOUNTS = discover_accounts()
 
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
-RETRY_CODES = {408, 425, 429, 500, 502, 503, 504}
+# 429 is deliberately NOT retried: it means we're checking too often, and
+# hammering a rate limit extends it (learned 2026-09-07 when the UI's 60 s
+# auto-poll × 3 accounts × 3 retries got every token throttled).
+RETRY_CODES = {408, 425, 500, 502, 503, 504}
 BACKOFF = (0.4, 1.2, 3.0)          # one entry per retry after the first attempt
 CLOCK_SKEW = 60                    # treat a token expiring within a minute as expired
 
@@ -178,6 +181,11 @@ def collect(account):
     try:
         usage, retries = fetch_usage(payload["accessToken"])
     except urllib.error.HTTPError as e:
+        if e.code == 429:
+            wait = e.headers.get("retry-after") if e.headers else None
+            hint = f"retry in {wait}s" if wait else "wait a few minutes"
+            return label, email, [f"  {YEL}✗ rate-limited (429) — too many "
+                                  f"status checks; {hint}{RST}"], False
         if e.code not in (401, 403):
             return label, email, [f"  {RED}✗ HTTP {e.code}{RST}"], False
         # Token was rejected: refresh once (unless we already did) and retry.
