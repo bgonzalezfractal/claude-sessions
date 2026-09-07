@@ -15,7 +15,9 @@ claude-sessions-ui --port 9000 --no-open
   schedules the default auto-continue for that session.
 - **Renew queue** — pending `claude-renew` tasks with fire times, done marks,
   daemon state, cancel buttons; a form for personalized scheduling
-  (reset auto/explicit, follow-up `+5h5m` / clock / off).
+  (reset auto/explicit, follow-up `+5h5m` / clock / off, and a **path** field
+  auto-filled from the selected session's cwd and editable — quick-renew
+  buttons pass the session's path too).
 - **Copy session** — from/to account pickers, session dropdown (newest first,
   LIVE flagged), dry-run and real copy; output lands in a toast.
 - **New account** — scaffolds an alias via `claude-account add` (login stays

@@ -23,7 +23,14 @@ anchor do its thing. Something interrupted → `claude-renew add` before bed.
 ## Commands
 
 ```bash
-# Register (reset time auto-detected from the usage API — exact, read-only):
+# Easiest: bare `claude-renew` opens the interactive wizard — numbered menus
+# for account and live session, every option validated with its default
+# pre-filled (path defaults to the session's cwd; auto-detected reset shown
+# before you accept it), summary + confirm at the end. `claude-renew setup`
+# is the same thing.
+claude-renew
+
+# Non-interactive (reset time auto-detected from the usage API):
 claude-renew add bggai radal-v2 --path ~/Documents/repos/radal/radal-app
 
 # Personalize everything:

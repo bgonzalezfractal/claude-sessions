@@ -168,7 +168,7 @@ h1 b{color:var(--pink)}
 .bar{flex:1;height:8px;background:#1a1a1a;border:1px solid var(--line)}
 .bar i{display:block;height:100%}
 .lim .pct{width:38px;text-align:right}
-.lim .rst{width:110px;color:var(--dim);font-size:11px;text-align:right}
+.lim .rst{width:150px;color:var(--dim);font-size:11px;text-align:right;white-space:nowrap}
 .sess{display:flex;justify-content:space-between;gap:6px;padding:3px 0;border-bottom:1px dashed #1b1b1b}
 .sess .t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .sess .live{color:var(--grn)}
@@ -196,6 +196,7 @@ label{color:var(--dim);font-size:11px;display:block;margin-top:6px}
   <div class="panel"><h2>Renew queue <span id="daemon"></span></h2><div id="renew"></div>
     <label>account</label><select id="r_acct"></select>
     <label>session (live)</label><select id="r_sess"></select>
+    <label>path (defaults to the session's cwd)</label><input id="r_path" placeholder="/path/to/project">
     <div class="row"><div><label>reset (auto / 5:40am)</label><input id="r_reset" placeholder="auto"></div>
     <div><label>follow-up (+5h5m / 10:50am / off)</label><input id="r_fu" placeholder="+5h5m"></div></div>
     <button style="margin-top:8px" onclick="renewAdd()">schedule renew</button></div>
@@ -246,7 +247,7 @@ async function refresh(){
     list.filter(s=>s.live).map(s=>`<div class="sess">
       <span class="t"><span class="live">●</span> ${esc(s.title||"(untitled)")}
       <span class="muted">· ${esc(acct)} · ${esc((s.cwd||"").replace(/^\/Users\/[^/]+/,"~"))}</span></span>
-      <button class="dim" onclick="quickRenew('${esc(acct)}','${esc(s.title)}')">renew</button>
+      <button class="dim" onclick="quickRenew('${esc(acct)}','${esc(s.title)}','${esc(s.cwd||"")}')">renew</button>
       </div>`).join("")).join("")||'<span class="muted">no live sessions</span>';
   $("daemon").textContent=O.renew_daemon?"· daemon ✓":"· daemon off";
   $("renew").innerHTML=O.renew.map(e=>{
@@ -265,20 +266,26 @@ async function refresh(){
 }
 function fillSess(){
   const rl=(O.sessions[$("r_acct").value]||[]).filter(s=>s.live);
-  $("r_sess").innerHTML=rl.map(s=>`<option>${esc(s.title)}</option>`).join("");
+  $("r_sess").innerHTML=rl.map(s=>`<option value="${esc(s.title)}"
+    data-cwd="${esc(s.cwd||"")}">${esc(s.title)}</option>`).join("");
+  fillPath();
   const cl=O.sessions[$("c_src").value]||[];
   $("c_sess").innerHTML=cl.map(s=>`<option value="${esc(s.sid)}">${esc(s.title||s.sid)}
     ${s.live?"(LIVE)":""}</option>`).join("");
 }
-$("r_acct")?.addEventListener("change",fillSess);
-document.addEventListener("change",e=>{if(e.target.id==="c_src")fillSess()});
+function fillPath(){const o=$("r_sess").selectedOptions[0];
+  $("r_path").value=o?o.dataset.cwd||"":""}
+document.addEventListener("change",e=>{
+  if(e.target.id==="r_acct"||e.target.id==="c_src")fillSess();
+  if(e.target.id==="r_sess")fillPath()});
 async function post(action,payload){
   toast("running "+action+"…",60000);
   const r=await(await fetch("/api/"+action,{method:"POST",body:JSON.stringify(payload)})).json();
   toast((r.ok?"✓ ":"✗ ")+action+"\n"+r.output.slice(-1200));refresh();return r}
 function renewAdd(){post("renew_add",{account:$("r_acct").value,session:$("r_sess").value,
+  path:$("r_path").value||null,
   reset:$("r_reset").value||"auto",follow_up:$("r_fu").value||"+5h5m"})}
-function quickRenew(acct,sess){post("renew_add",{account:acct,session:sess})}
+function quickRenew(acct,sess,cwd){post("renew_add",{account:acct,session:sess,path:cwd||null})}
 function renewRemove(s,a){post("renew_remove",{session:s,account:a})}
 function copySess(dry){post("copy",{src:$("c_src").value,dst:$("c_dst").value,
   session:$("c_sess").value,dry_run:dry})}

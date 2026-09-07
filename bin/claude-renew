@@ -106,6 +106,25 @@ def norm_path(p):
     return os.path.realpath(os.path.expanduser(p)) if p else None
 
 
+def all_live_sessions(account):
+    """Every live session on the account: [{name, cwd, pid}] newest-first."""
+    sess_dir = os.path.join(config_dir(account), "sessions")
+    out = []
+    if not os.path.isdir(sess_dir):
+        return out
+    for fn in os.listdir(sess_dir):
+        if not fn.endswith(".json"):
+            continue
+        try:
+            j = json.load(open(os.path.join(sess_dir, fn)))
+            os.kill(j["pid"], 0)
+        except Exception:
+            continue
+        out.append({"name": j.get("name") or "(unnamed)", "cwd": j.get("cwd"),
+                    "pid": j["pid"], "started": j.get("startedAt", 0)})
+    return sorted(out, key=lambda s: -s["started"])
+
+
 def find_live_sessions(account, name, path=None):
     """All live sessions with this name (and cwd, when path is given)."""
     sess_dir = os.path.join(config_dir(account), "sessions")
@@ -332,6 +351,101 @@ def cmd_run_daemon(_a):
             pass
 
 
+# ------------------------------------------------------------------- wizard ---
+def ask(prompt, default=None, validate=None):
+    while True:
+        sfx = f" [{default}]" if default not in (None, "") else ""
+        v = input(f"  {prompt}{sfx}: ").strip() or (default or "")
+        if not v:
+            print("    ✗ required")
+            continue
+        if validate:
+            try:
+                validate(v)
+            except Exception as e:
+                print(f"    ✗ {e}")
+                continue
+        return v
+
+
+def pick(title, items, render):
+    print(f"\n{title}")
+    for i, it in enumerate(items, 1):
+        print(f"    {i}. {render(it)}")
+    def valid(v):
+        if not (v.isdigit() and 1 <= int(v) <= len(items)):
+            raise ValueError(f"pick 1-{len(items)}")
+    return items[int(ask("choice", "1", valid)) - 1]
+
+
+def cmd_wizard(_a=None):
+    """Interactive, validated setup with every option defaulted."""
+    if not sys.stdin.isatty():
+        sys.exit("no TTY — use: claude-renew add <account> <session> [options]")
+    print("── claude-renew · schedule an auto-continue ──")
+
+    rows = [(name, len(all_live_sessions(name))) for name in ACCOUNTS]
+    acct = pick("account", rows, lambda r: f"{r[0]:<10} {r[1]} live session(s)")[0]
+
+    live = all_live_sessions(acct)
+    if not live:
+        sys.exit(f"no live sessions on {acct!r} — open the session in a "
+                 f"terminal first (this tool messages running sessions).")
+    sess = pick(f"live sessions on {acct}", live,
+                lambda s: f"{s['name']:<26} {s['cwd']}")
+
+    def vpath(v):
+        p = norm_path(v)
+        if not os.path.isdir(p):
+            raise ValueError(f"not a directory: {p}")
+    path = norm_path(ask("path", sess["cwd"], vpath))
+    if path != norm_path(sess["cwd"]):
+        print(f"    ! differs from the session's cwd ({sess['cwd']}) — the task "
+              f"only fires while a live session named {sess['name']!r} runs in "
+              f"that path.")
+        if ask("continue anyway? (y/n)", "n").lower() not in ("y", "yes"):
+            return cmd_wizard()
+
+    detected, info = session_reset_at(acct)
+    if detected and detected > datetime.now():
+        print(f"\n  detected reset: {detected:%a %H:%M} ({info})")
+        reset = ask("reset", "auto",
+                    lambda v: v == "auto" or parse_clock(v))
+    else:
+        why = info if not detected else f"{detected:%H:%M} already past"
+        print(f"\n  ! couldn't use auto reset ({why}) — give the reset time "
+              f"from the limit banner")
+        reset = ask("reset (e.g. 5:40am)", None, parse_clock)
+
+    delay = int(ask("delay after reset, minutes", "5",
+                    lambda v: int(v) >= 0 or True))
+    fu = ask("follow-up (+5h5m / 10:50am / off)", "+5h5m",
+             lambda v: parse_followup(v, datetime.now()))
+    msg = ask("continue message", DEFAULT_CONTINUE[:44] + "…")
+    if msg == DEFAULT_CONTINUE[:44] + "…":
+        msg = DEFAULT_CONTINUE
+    fmsg = ask("follow-up message", DEFAULT_FOLLOWUP[:44] + "…") \
+        if fu.lower() not in ("off", "none", "no") else DEFAULT_FOLLOWUP
+    if fmsg == DEFAULT_FOLLOWUP[:44] + "…":
+        fmsg = DEFAULT_FOLLOWUP
+    ttl = int(ask("task lifetime, hours", "24", lambda v: int(v) > 0 or True))
+
+    print(f"""
+── summary ──
+  account   : {acct}
+  session   : {sess['name']}
+  path      : {path}
+  reset     : {reset}   continue: reset + {delay}m   follow-up: {fu}
+  ttl       : {ttl}h""")
+    if ask("schedule? (y/n)", "y").lower() not in ("y", "yes"):
+        print("aborted")
+        return
+    import types
+    cmd_add(types.SimpleNamespace(
+        account=acct, session=sess["name"], path=path, reset=reset,
+        delay=delay, follow_up=fu, message=msg, follow_up_message=fmsg, ttl=ttl))
+
+
 # ----------------------------------------------------------------- commands ---
 def cmd_add(a):
     if a.account not in ACCOUNTS:
@@ -444,9 +558,12 @@ def cmd_log(a):
 
 
 def main():
+    if len(sys.argv) == 1 and sys.stdin.isatty():
+        return cmd_wizard()   # bare `claude-renew` -> interactive, validated setup
     ap = argparse.ArgumentParser(
         prog="claude-renew",
-        description="Resume interrupted sessions the moment their limit renews.")
+        description="Resume interrupted sessions the moment their limit renews. "
+                    "Run with no arguments for the interactive setup wizard.")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("add", help="register a session to auto-continue at reset")
@@ -468,6 +585,9 @@ def main():
     p.add_argument("--ttl", type=int, default=24, metavar="HOURS",
                    help="task lifetime (default 24h)")
     p.set_defaults(fn=cmd_add)
+
+    p = sub.add_parser("setup", help="interactive setup wizard (same as no args)")
+    p.set_defaults(fn=cmd_wizard)
 
     p = sub.add_parser("list", help="show pending tasks and daemon state")
     p.set_defaults(fn=cmd_list)
