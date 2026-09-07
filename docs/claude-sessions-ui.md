@@ -30,7 +30,9 @@ claude-sessions-ui --port 9000 --no-open
   re-home the copy), dry-run and real copy; output lands in a toast.
 - **New account** — scaffolds an alias via `claude-account add` (login stays
   manual, instructions in the toast).
-- **Activity** — the SQLite-backed action history.
+- **Activity** — two sections: the merged scheduler log (`claude-log`: reset
+  pings, continues, follow-up anchors, retries) and the SQLite-backed UI
+  action history.
 
 ## Architecture
 

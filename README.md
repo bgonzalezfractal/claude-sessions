@@ -14,6 +14,7 @@ Three pieces, one strategy — anchor windows early, never waste a renewal:
 | **`claude-renew`** | When a session was **cut mid-task** overnight: auto-continues it at reset + 5 min (e.g. 5:45 AM) and sends a follow-up anchor 5 h later (10:50) — the earliest possible restart of your day. | [docs/claude-renew.md](docs/claude-renew.md) |
 | **`claude-copy-session`** | Migrate a session between accounts by name — front-end over the proven migrate script (transcript, sidecar, memory, tasks, config entry). | [docs/claude-copy-session.md](docs/claude-copy-session.md) |
 | **`claude-account`** | List account aliases (login state, keychain, live sessions) or scaffold a new one; new accounts auto-join every tool after first login. | [docs/claude-account.md](docs/claude-account.md) |
+| **`claude-log`** | One chronological stream of everything the toolkit did: morning reset pings, scheduled continues, follow-up anchors, retries (`-n`, `--kind`, `--json`, `-f`). Also shown in the app's Activity view. | — |
 | **`claude-sessions-ui`** | Localhost dashboard (stdlib server + SQLite audit log at 127.0.0.1:8788) wrapping all of the above. | [docs/claude-sessions-ui.md](docs/claude-sessions-ui.md) |
 
 **When to use which:** if nothing is in progress, do nothing — the morning job
@@ -39,6 +40,9 @@ claude-account list                 # aliases + login/keychain/live state
 claude-account add work             # scaffold ~/.claude-work + zshrc alias
 
 claude-sessions-ui                  # dashboard at http://127.0.0.1:8788
+
+claude-log                          # merged log: reset pings + continues + follow-ups
+claude-log --kind continue,follow-up -f   # filter / live-tail
 ```
 
 ## Install

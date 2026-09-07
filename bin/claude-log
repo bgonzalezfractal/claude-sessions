@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""
+claude-log — one chronological stream of everything the toolkit did:
+morning reset pings, scheduled continues, follow-up anchors, retries.
+
+    claude-log [-n 30] [--json] [-f] [--kind continue|follow-up|reset-ping|...]
+
+Sources (merged by timestamp):
+  ~/.claude/claude-renew/renew.log       scheduled continues / follow-ups
+  ~/.claude/cron-limit-reset.log(.1)     the 7:30 / 10:30 morning anchor pings
+
+Kinds: reset-ping · continue · follow-up · scheduled · retry · gave-up ·
+       removed · daemon
+"""
+
+import argparse, json, os, re, subprocess, sys
+from datetime import datetime
+
+HOME = os.path.expanduser("~")
+RENEW_LOG = os.path.join(HOME, ".claude", "claude-renew", "renew.log")
+RESET_LOGS = [os.path.join(HOME, ".claude", "cron-limit-reset.log.1"),
+              os.path.join(HOME, ".claude", "cron-limit-reset.log")]
+
+BOLD, DIM, RST = "\033[1m", "\033[2m", "\033[0m"
+COLORS = {"continue": "\033[96m", "follow-up": "\033[95m",
+          "reset-ping": "\033[32m", "retry": "\033[33m",
+          "gave-up": "\033[31m", "scheduled": "\033[36m",
+          "removed": "\033[33m", "daemon": "\033[2m"}
+
+
+def classify_renew(msg):
+    if msg.startswith("FIRED continue"):
+        return "continue"
+    if msg.startswith("FIRED follow-up"):
+        return "follow-up"
+    if msg.startswith(("added", "registered", "detected")):
+        return "scheduled"
+    if "retry" in msg:
+        return "retry"
+    if msg.startswith("GAVE UP"):
+        return "gave-up"
+    if msg.startswith("removed") or msg.startswith("cancelled"):
+        return "removed"
+    return "daemon"
+
+
+def parse_renew():
+    events = []
+    if not os.path.exists(RENEW_LOG):
+        return events
+    for line in open(RENEW_LOG, errors="replace"):
+        m = re.match(r"\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\] (.*)", line)
+        if not m:
+            continue
+        ts, msg = m.groups()
+        events.append({"ts": ts, "source": "renew",
+                       "kind": classify_renew(msg), "detail": msg.strip()})
+    return events
+
+
+def parse_reset():
+    events, ts = [], None
+    for path in RESET_LOGS:
+        if not os.path.exists(path):
+            continue
+        for line in open(path, errors="replace"):
+            m = re.match(r"=== (.*) ===", line)
+            if m:
+                # e.g. "Sun Sep  6 07:30:05 -03 2026" — the short "-03" offset
+                # is not %z-parseable; times are local anyway, so drop it.
+                parts = [p for p in m.group(1).split()
+                         if not re.fullmatch(r"[+-]\d{2}(:?\d{2})?", p)]
+                try:
+                    ts = datetime.strptime(" ".join(parts),
+                                           "%a %b %d %H:%M:%S %Y") \
+                        .strftime("%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    ts = None
+                continue
+            m = re.match(r"\[(\S+)\] (.*)", line)
+            if m and ts:
+                label, out = m.groups()
+                events.append({"ts": ts, "source": "limit-reset",
+                               "kind": "reset-ping",
+                               "detail": f"{label}: {out.strip()}"})
+    return events
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="claude-log",
+        description="Merged log of reset pings, continues and follow-ups.")
+    ap.add_argument("-n", type=int, default=30, help="events to show (default 30)")
+    ap.add_argument("--kind", help="filter by kind (comma-separated)")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("-f", "--follow", action="store_true",
+                    help="live-tail both source logs")
+    a = ap.parse_args()
+
+    if a.follow:
+        os.execvp("tail", ["tail", "-n", "5", "-F", RENEW_LOG, RESET_LOGS[-1]])
+
+    events = sorted(parse_renew() + parse_reset(), key=lambda e: e["ts"])
+    if a.kind:
+        kinds = {k.strip() for k in a.kind.split(",")}
+        events = [e for e in events if e["kind"] in kinds]
+    events = events[-a.n:]
+
+    if a.json:
+        print(json.dumps(events, indent=1))
+        return
+
+    if not events:
+        print("no events yet")
+        return
+    for e in events:
+        c = COLORS.get(e["kind"], "")
+        print(f"{DIM}{e['ts'][5:16]}{RST}  {c}{e['kind']:<10}{RST} {e['detail']}")
+
+
+if __name__ == "__main__":
+    main()

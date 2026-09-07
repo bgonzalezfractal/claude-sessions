@@ -94,6 +94,7 @@ def overview(with_usage=False):
         pass
     return {"accounts": accounts, "usage": usage, "sessions": sessions,
             "renew": renew, "renew_daemon": daemon, "events": recent_events(),
+            "log": cli_json("claude-log", "--json", "-n", "60") or [],
             "now": datetime.now().strftime("%a %d %b · %H:%M:%S")}
 
 
@@ -315,8 +316,11 @@ th{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.1em}
 </div>
 
 <div class="view" id="v-activity">
-  <h1>Activity</h1><div class="sub">every action, persisted in ~/.claude/claude-sessions-ui.db</div>
-  <div class="card" id="e-list"></div>
+  <h1>Activity</h1><div class="sub">scheduler fires, morning pings, and UI actions</div>
+  <div class="card"><h2>Scheduler &amp; pings <span class="muted">· claude-log</span></h2>
+    <div id="l-list"></div></div>
+  <div class="card"><h2>UI actions <span class="muted">· sqlite</span></h2>
+    <div id="e-list"></div></div>
 </div>
 </main>
 <div id="toast" onclick="this.style.display='none'"></div>
@@ -403,6 +407,13 @@ async function refresh(withUsage=false){
     <td class="aname">${esc(a.alias)}</td><td>${esc(a.shell_alias||"—")}</td>
     <td>${a.logged_in?"✓ "+esc(a.email):'<span style="color:var(--red)">not logged in</span>'}</td>
     <td>${a.keychain?"✓":"✗"}</td><td>${a.live_sessions}</td></tr>`).join("");
+  const KC={"continue":"var(--cyn)","follow-up":"var(--pink)","reset-ping":"var(--grn)",
+    "retry":"var(--yel)","gave-up":"var(--red)","scheduled":"#7ec8ff","removed":"var(--yel)"};
+  $("l-list").innerHTML=(O.log||[]).slice().reverse().map(e=>`<div class="ev">
+    <span class="ts">${esc(e.ts.slice(5,16))}</span>
+    <b style="color:${KC[e.kind]||"var(--dim)"}">${esc(e.kind)}</b>
+    <span class="muted">${esc(e.detail.slice(0,130))}</span></div>`).join("")
+    ||'<span class="muted">nothing yet</span>';
   $("e-list").innerHTML=O.events.map(e=>`<div class="ev">
     <span class="${e.ok?"ok":"fail"}">${e.ok?"✓":"✗"}</span>
     <span class="ts">${e.ts.slice(5,16).replace("T"," ")}</span>
