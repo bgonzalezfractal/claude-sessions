@@ -124,6 +124,18 @@ Everything below is keyed by session id, and all of it is needed for a clean res
    heading; the old index is kept as `MEMORY.md.bak`). A plain copy would have replaced a
    12 KB / 85-file index with a 3 KB / 16-file one.
 
+### Path rewriting (added 2026-09-07)
+
+After copying, the script rewrites `<src-config-dir>/` → `<dst-config-dir>/`
+inside the copied transcript and sidecar text files (`.json/.jsonl/.js/.md/.txt`).
+Without this, a resumed session reads stale absolute paths out of its own
+history — e.g. an ultracode **Workflow** whose `scriptPath` and `wf_*.json`
+resume journals point at the source config dir, which the Workflow tool
+refuses. (The trailing slash in the match prevents `~/.claude` from also
+mangling `~/.claude-benjr` paths.) Consequence: the destination transcript is
+no longer byte-identical to the source — hash-compare verification only holds
+for sessions that never referenced their config dir.
+
 ## Verifying a migration
 
 ```bash

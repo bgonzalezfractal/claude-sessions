@@ -121,6 +121,39 @@ echo "[1/6] transcript + sidecar dirs"
 "${RS[@]}" "$TRANSCRIPT" "$DST/projects/$DST_KEY/"
 [ -d "$PROJ_DIR/$SID" ] && "${RS[@]}" "$PROJ_DIR/$SID/" "$DST/projects/$DST_KEY/$SID/"
 
+# ---- 1b. rewrite absolute config-dir paths inside the copy -------------------
+# Tool results, workflow journals and scripts record absolute paths under the
+# SOURCE config dir (e.g. an ultracode Workflow's scriptPath + its wf_*.json
+# resume state). The copy runs under the destination dir and tools refuse the
+# old paths (hit 2026-09-07 resuming a workflow after migration). Rewrite
+# "$SRC/" -> "$DST/" — trailing slash matters: without it, migrating FROM
+# ~/.claude would also mangle ~/.claude-benjr paths.
+if [ "$DRY" != "--dry-run" ]; then
+  echo "[1b/6] rewrite $SRC/ -> $DST/ inside the copy"
+  python3 - "$SRC/" "$DST/" "$DST/projects/$DST_KEY/$SID.jsonl" "$DST/projects/$DST_KEY/$SID" <<'PY'
+import os, sys
+src, dst, transcript, sidecar = sys.argv[1:5]
+targets = [transcript]
+for root, _, files in os.walk(sidecar):
+    targets += [os.path.join(root, f) for f in files
+                if f.endswith((".json", ".jsonl", ".js", ".md", ".txt"))]
+n = 0
+for p in targets:
+    if not os.path.isfile(p):
+        continue
+    try:
+        t = open(p, encoding="utf-8").read()
+    except (UnicodeDecodeError, OSError):
+        continue
+    if src in t:
+        open(p, "w", encoding="utf-8").write(t.replace(src, dst))
+        n += 1
+print(f"      rewrote {n} file(s)")
+PY
+else
+  echo "[1b/6] (dry run) would rewrite $SRC/ -> $DST/ inside the copy"
+fi
+
 # ---- 2. project memory (MEMORY.md + memory files) ---------------------------
 # ADDITIVE: the destination account has its own memory for this project. Never
 # overwrite a memory file that already exists there (its MEMORY.md index is
