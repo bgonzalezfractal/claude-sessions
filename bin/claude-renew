@@ -1,0 +1,489 @@
+#!/usr/bin/env python3
+"""
+claude-renew — resume an interrupted session the moment its limit renews.
+
+The scenario: a session runs out at 2–3 AM mid-task and renews at, say, 5:40 AM.
+You go to bed. Because the work was interrupted, waiting for the 7:30 morning
+anchor wastes the 5:40 renewal. So you register the session before bed:
+
+    claude-renew add bggai radal-v2 --path ~/Documents/repos/radal/radal-app
+
+and the daemon (24 h, self-expiring) will:
+  1. at reset + 5 min (5:45) message the live session to CONTINUE its pending task;
+  2. at continue + 5 h 05 m (10:50) send a follow-up "hi" that anchors the next
+     window at the earliest possible moment of your day.
+
+If nothing was interrupted, don't register — the morning limit-reset job
+(7:30 weekdays / 10:30 weekends) already anchors the day.
+
+Every timing and message is personalizable per task; `remove` cancels pending
+tasks. Run `claude-renew --help` / `claude-renew add --help`.
+
+Mechanics (validated live 2026-09-06):
+  * Sessions are addressed by their /rename alias and must be LIVE (terminal
+    open). They are found in <config>/sessions/<pid>.json; --path additionally
+    pins the session's working directory.
+  * Delivery is a headless `claude -p --model haiku` helper on the SAME account
+    (peer visibility is per config dir) using ListAgents + SendMessage. The
+    prompt goes via stdin because --allowedTools is variadic.
+  * The default account runs WITHOUT CLAUDE_CONFIG_DIR (keychain gotcha).
+  * `--reset auto` (the default) reads the account's OAuth token from the macOS
+    keychain and GETs api/oauth/usage — the exact session `resets_at`, read-only,
+    no window anchored.
+"""
+
+import argparse, hashlib, json, os, re, subprocess, sys, time
+import urllib.error, urllib.request
+from datetime import datetime, timedelta, timezone
+
+HOME = os.path.expanduser("~")
+BASE = os.path.join(HOME, ".claude", "claude-renew")
+REGISTRY = os.path.join(BASE, "registry.json")
+PIDFILE = os.path.join(BASE, "daemon.pid")
+LOG = os.path.join(BASE, "renew.log")
+CLAUDE_BIN = "/opt/homebrew/bin/claude"
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+
+ACCOUNTS = {
+    "default": None,  # None => no CLAUDE_CONFIG_DIR (default-account keychain gotcha)
+    "benjr": os.path.join(HOME, ".claude-benjr"),
+    "bggai": os.path.join(HOME, ".claude-bggai"),
+}
+
+DEFAULT_CONTINUE = ("Your usage limit has reset (scheduled auto-continue). "
+                    "Please continue with the pending task exactly where you left off.")
+DEFAULT_FOLLOWUP = "hi (scheduled window anchor — just reply 'hi', nothing else)"
+
+TICK_SECONDS = 30
+RETRY_MINUTES = 10
+MAX_RETRIES = 8
+
+
+# ------------------------------------------------------------------ helpers ---
+def log(msg):
+    line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+    os.makedirs(BASE, exist_ok=True)
+    with open(LOG, "a") as f:
+        f.write(line + "\n")
+    print(line)
+
+
+def load_registry():
+    try:
+        with open(REGISTRY) as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_registry(entries):
+    os.makedirs(BASE, exist_ok=True)
+    tmp = REGISTRY + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(entries, f, indent=1)
+    os.replace(tmp, REGISTRY)
+
+
+def config_dir(account):
+    return ACCOUNTS[account] or os.path.join(HOME, ".claude")
+
+
+def account_env(account):
+    env = dict(os.environ)
+    env.pop("CLAUDE_CONFIG_DIR", None)
+    if ACCOUNTS[account]:
+        env["CLAUDE_CONFIG_DIR"] = ACCOUNTS[account]
+    return env
+
+
+def norm_path(p):
+    return os.path.realpath(os.path.expanduser(p)) if p else None
+
+
+def find_live_sessions(account, name, path=None):
+    """All live sessions with this name (and cwd, when path is given)."""
+    sess_dir = os.path.join(config_dir(account), "sessions")
+    hits = []
+    if not os.path.isdir(sess_dir):
+        return hits
+    for fn in os.listdir(sess_dir):
+        if not fn.endswith(".json"):
+            continue
+        try:
+            j = json.load(open(os.path.join(sess_dir, fn)))
+        except Exception:
+            continue
+        if j.get("name") != name:
+            continue
+        if path and norm_path(j.get("cwd")) != path:
+            continue
+        try:
+            os.kill(j["pid"], 0)
+        except Exception:
+            continue
+        hits.append(j)
+    return hits
+
+
+# ------------------------------------------- reset-time detection (read-only) ---
+def keychain_service(account):
+    d = ACCOUNTS[account]
+    if d is None:
+        return "Claude Code-credentials"
+    return "Claude Code-credentials-" + hashlib.sha256(d.encode()).hexdigest()[:8]
+
+
+def read_token(account):
+    r = subprocess.run(["security", "find-generic-password", "-s",
+                        keychain_service(account), "-w"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    try:
+        return json.loads(r.stdout)["claudeAiOauth"]["accessToken"]
+    except Exception:
+        return None
+
+
+def refresh_token(account):
+    """`claude auth status --json` refreshes the token; measured safe to run
+    alongside a live session (it does not write .claude.json)."""
+    try:
+        subprocess.run([CLAUDE_BIN, "auth", "status", "--json"],
+                       env=account_env(account), capture_output=True,
+                       text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def session_reset_at(account):
+    """Exact local datetime the account's 5-hour session limit resets, plus the
+    limit's percent/is_active. Read-only; anchors nothing. -> (dt|None, info)."""
+    token = read_token(account)
+    if not token:
+        return None, "no keychain token"
+    for attempt in (1, 2):
+        req = urllib.request.Request(USAGE_URL, headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": "oauth-2025-04-20",
+            "anthropic-version": "2023-06-01"})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                usage = json.load(r)
+            break
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403) and attempt == 1:
+                refresh_token(account)
+                token = read_token(account) or ""
+                continue
+            return None, f"HTTP {e.code}"
+        except OSError as e:
+            return None, str(e)
+    for l in usage.get("limits", []):
+        if l.get("kind") == "session":
+            iso = l.get("resets_at")
+            if not iso:
+                return None, "no active session window"
+            dt = datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone()
+            info = f"{l.get('percent', '?')}% used" + \
+                   (", LIMITED" if l.get("is_active") else "")
+            return dt.replace(tzinfo=None), info
+    return None, "no session limit in response"
+
+
+def parse_clock(s):
+    """'5:40am' / '11pm' -> next future datetime with that wall time."""
+    m = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)", s.strip().lower())
+    if not m:
+        raise ValueError(f"can't parse time {s!r} — use forms like 5:40am, 11pm")
+    h, mi, ap = int(m.group(1)), int(m.group(2) or 0), m.group(3)
+    if ap == "pm" and h != 12:
+        h += 12
+    if ap == "am" and h == 12:
+        h = 0
+    now = datetime.now()
+    t = now.replace(hour=h, minute=mi, second=0, microsecond=0)
+    if t <= now:
+        t += timedelta(days=1)
+    return t
+
+
+def parse_followup(spec, continue_at):
+    """'off' -> None; '+5h5m'/'+5:05' -> continue_at+delta; '10:50am' -> clock."""
+    s = spec.strip().lower()
+    if s in ("off", "none", "no"):
+        return None
+    if s.startswith("+"):
+        m = re.fullmatch(r"\+(?:(\d+)h)?(?:(\d+)m)?", s) or \
+            re.fullmatch(r"\+(\d+):(\d{2})", s)
+        if not m or not any(m.groups()):
+            raise ValueError(f"can't parse follow-up {spec!r} — use +5h5m, +5:05, "
+                             f"a clock time like 10:50am, or off")
+        h, mi = int(m.group(1) or 0), int(m.group(2) or 0)
+        return continue_at + timedelta(hours=h, minutes=mi)
+    return parse_clock(s)
+
+
+# ---------------------------------------------------------------- messaging ---
+def helper_prompt(session_name, message):
+    return (f"You are a scheduling helper. Use ListAgents to find the local session "
+            f"named '{session_name}', then use SendMessage to send it exactly this "
+            f"message: {json.dumps(message)}. Then output DONE. If no session with "
+            f"that name is listed, output NOT-FOUND plus the names you saw. "
+            f"Do nothing else.")
+
+
+def run_helper(account, cwd, prompt_text, timeout=300):
+    cmd = [CLAUDE_BIN, "-p", "--model", "haiku",
+           "--allowedTools", "ListAgents,SendMessage"]
+    try:
+        r = subprocess.run(cmd, input=prompt_text, text=True, env=account_env(account),
+                           cwd=cwd if cwd and os.path.isdir(cwd) else HOME,
+                           capture_output=True, timeout=timeout)
+        out = (r.stdout or "") + (r.stderr or "")
+        return r.returncode == 0, out.strip()
+    except subprocess.TimeoutExpired:
+        return False, "helper timed out"
+
+
+def fire(entry, action):
+    account, name, path = entry["account"], entry["session"], entry.get("path")
+    live = find_live_sessions(account, name, path)
+    if len(live) > 1:
+        log(f"warning: {len(live)} live sessions named {name!r} — messaging by "
+            f"name may hit either")
+    if not live:
+        _reschedule(action, f"session {name!r} not live"
+                            + (f" at {path}" if path else ""))
+        return
+    ok, out = run_helper(account, path or live[0].get("cwd"),
+                         helper_prompt(name, action["message"]))
+    tail = out[-200:].replace("\n", " ")
+    if ok and "DONE" in out:
+        action["done"] = True
+        log(f"FIRED {action['kind']} -> {account}/{name}: {tail}")
+    elif re.search(r"hit your session limit", out, re.I):
+        _reschedule(action, f"{account} still limited")
+    elif "NOT-FOUND" in out:
+        _reschedule(action, f"helper couldn't see {name!r}: {tail}")
+    else:
+        _reschedule(action, f"helper failed: {tail}")
+
+
+def _reschedule(action, why):
+    action["retries"] += 1
+    if action["retries"] > MAX_RETRIES:
+        action["done"] = True
+        log(f"GAVE UP on {action['kind']} after {MAX_RETRIES} retries ({why})")
+        return
+    action["at"] = (datetime.now() + timedelta(minutes=RETRY_MINUTES)
+                    ).isoformat(timespec="seconds")
+    log(f"{why} — retry {action['retries']}/{MAX_RETRIES} at {action['at'][11:16]}")
+
+
+# ------------------------------------------------------------------- daemon ---
+def ensure_daemon():
+    try:
+        pid = int(open(PIDFILE).read().strip())
+        os.kill(pid, 0)
+        return
+    except Exception:
+        pass
+    p = subprocess.Popen([sys.executable, os.path.realpath(__file__), "run-daemon"],
+                         start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    log(f"daemon spawned (pid {p.pid})")
+
+
+def cmd_run_daemon(_a):
+    os.makedirs(BASE, exist_ok=True)
+    with open(PIDFILE, "w") as f:
+        f.write(str(os.getpid()))
+    log(f"daemon started (pid {os.getpid()})")
+    try:
+        while True:
+            now = datetime.now()
+            entries = [e for e in load_registry()
+                       if datetime.fromisoformat(e["expires_at"]) > now]
+            changed = False
+            for e in entries:
+                for a in e["actions"]:
+                    if not a["done"] and datetime.fromisoformat(a["at"]) <= now:
+                        fire(e, a)
+                        changed = True
+            pending = [e for e in entries
+                       if any(not a["done"] for a in e["actions"])]
+            if changed or len(pending) != len(load_registry()):
+                save_registry(pending)
+            if not pending:
+                log("nothing pending — daemon exiting")
+                break
+            time.sleep(TICK_SECONDS)
+    finally:
+        try:
+            os.remove(PIDFILE)
+        except OSError:
+            pass
+
+
+# ----------------------------------------------------------------- commands ---
+def cmd_add(a):
+    if a.account not in ACCOUNTS:
+        sys.exit(f"unknown account {a.account!r} — one of: {', '.join(ACCOUNTS)}")
+    path = norm_path(a.path)
+
+    live = find_live_sessions(a.account, a.session, path)
+    if not live:
+        where = f" with cwd {path}" if path else ""
+        others = find_live_sessions(a.account, a.session) if path else []
+        hint = (f" (a live {a.session!r} exists at {others[0].get('cwd')})"
+                if others else "")
+        sys.exit(f"no LIVE session named {a.session!r}{where} on {a.account!r}{hint}"
+                 f" — keep the session's terminal open, then re-run.")
+    if not path:
+        path = norm_path(live[0].get("cwd"))
+
+    if a.reset == "auto":
+        reset_at, info = session_reset_at(a.account)
+        if not reset_at:
+            sys.exit(f"couldn't auto-detect reset time ({info}) — pass "
+                     f"--reset HH:MMam explicitly.")
+        log(f"detected session reset for {a.account}: "
+            f"{reset_at:%a %H:%M} ({info})")
+        if reset_at <= datetime.now():
+            sys.exit(f"detected reset {reset_at:%H:%M} is already past — the "
+                     f"account is usable now; just continue the session yourself.")
+    else:
+        reset_at = parse_clock(a.reset)
+
+    continue_at = reset_at + timedelta(minutes=a.delay)
+    followup_at = parse_followup(a.follow_up, continue_at)
+
+    actions = [{"kind": "continue", "at": continue_at.isoformat(timespec="seconds"),
+                "message": a.message, "retries": 0, "done": False}]
+    if followup_at:
+        actions.append({"kind": "follow-up",
+                        "at": followup_at.isoformat(timespec="seconds"),
+                        "message": a.follow_up_message, "retries": 0, "done": False})
+
+    entries = [e for e in load_registry()
+               if not (e["account"] == a.account and e["session"] == a.session
+                       and e.get("path") == path)]
+    entries.append({
+        "account": a.account, "session": a.session, "path": path,
+        "reset_at": reset_at.isoformat(timespec="seconds"),
+        "actions": actions,
+        "expires_at": (datetime.now() + timedelta(hours=a.ttl)
+                       ).isoformat(timespec="seconds"),
+    })
+    save_registry(entries)
+    plan = f"continue @ {continue_at:%a %H:%M}"
+    if followup_at:
+        plan += f", follow-up @ {followup_at:%a %H:%M}"
+    log(f"added {a.account}/{a.session} ({path}): {plan} (expires in {a.ttl}h)")
+    ensure_daemon()
+
+
+def cmd_list(_a):
+    entries = load_registry()
+    if not entries:
+        print("no pending tasks")
+    for e in entries:
+        acts = ", ".join(
+            f"{x['kind']} @ {x['at'][:16].replace('T', ' ')}"
+            + (" ✓" if x["done"] else (f" (retry {x['retries']})" if x["retries"] else ""))
+            for x in e["actions"])
+        print(f"{e['account']}/{e['session']}  [{e.get('path', '?')}]\n"
+              f"  reset {e['reset_at'][:16].replace('T', ' ')} — {acts}")
+    try:
+        pid = int(open(PIDFILE).read().strip())
+        os.kill(pid, 0)
+        print(f"daemon: running (pid {pid})")
+    except Exception:
+        if entries and any(not x["done"] for e in entries for x in e["actions"]):
+            print("daemon: NOT running — run any `claude-renew add` or "
+                  "`claude-renew start` to revive it")
+        else:
+            print("daemon: not running (nothing pending)")
+
+
+def cmd_remove(a):
+    entries = load_registry()
+    if a.session == "all":
+        kept = []
+    else:
+        kept = [e for e in entries
+                if e["session"] != a.session
+                or (a.account and e["account"] != a.account)]
+    save_registry(kept)
+    n = len(entries) - len(kept)
+    log(f"removed {n} task(s)" + ("" if n else f" — nothing matched {a.session!r}"))
+
+
+def cmd_start(_a):
+    if any(not x["done"] for e in load_registry() for x in e["actions"]):
+        ensure_daemon()
+    else:
+        print("nothing pending — daemon not needed")
+
+
+def cmd_log(a):
+    if not os.path.exists(LOG):
+        print("no log yet")
+        return
+    if a.follow:
+        subprocess.run(["tail", "-f", LOG])
+    else:
+        subprocess.run(["tail", "-30", LOG])
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="claude-renew",
+        description="Resume interrupted sessions the moment their limit renews.")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("add", help="register a session to auto-continue at reset")
+    p.add_argument("account", choices=list(ACCOUNTS), help="account alias")
+    p.add_argument("session", help="session name (its /rename alias)")
+    p.add_argument("--path", help="project path the session must live in "
+                                  "(default: taken from the live session)")
+    p.add_argument("--reset", default="auto",
+                   help="'auto' (query the usage API, default) or HH:MMam")
+    p.add_argument("--delay", type=int, default=5, metavar="MIN",
+                   help="minutes after reset to send the continue (default 5)")
+    p.add_argument("--follow-up", default="+5h5m", metavar="WHEN",
+                   help="anchor message: '+5h5m' after continue (default), "
+                        "a clock time like 10:50am, or 'off'")
+    p.add_argument("--message", default=DEFAULT_CONTINUE,
+                   help="custom continue message")
+    p.add_argument("--follow-up-message", default=DEFAULT_FOLLOWUP,
+                   help="custom follow-up message")
+    p.add_argument("--ttl", type=int, default=24, metavar="HOURS",
+                   help="task lifetime (default 24h)")
+    p.set_defaults(fn=cmd_add)
+
+    p = sub.add_parser("list", help="show pending tasks and daemon state")
+    p.set_defaults(fn=cmd_list)
+
+    p = sub.add_parser("remove", help="cancel pending task(s)")
+    p.add_argument("session", help="session name, or 'all'")
+    p.add_argument("--account", help="restrict to one account")
+    p.set_defaults(fn=cmd_remove)
+
+    p = sub.add_parser("start", help="revive the daemon if tasks are pending")
+    p.set_defaults(fn=cmd_start)
+
+    p = sub.add_parser("log", help="show the activity log")
+    p.add_argument("-f", "--follow", action="store_true")
+    p.set_defaults(fn=cmd_log)
+
+    p = sub.add_parser("run-daemon", help=argparse.SUPPRESS)
+    p.set_defaults(fn=cmd_run_daemon)
+
+    a = ap.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

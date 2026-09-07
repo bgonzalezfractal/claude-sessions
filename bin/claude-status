@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""
+claude-status — usage limits for all Claude accounts, non-interactively.
+
+Reads each account's OAuth token from the macOS keychain (the CLI's own entries)
+and calls the same read-only endpoint the /status Usage tab uses
+(GET https://api.anthropic.com/api/oauth/usage). Shows the three limits per
+account: session (5h), weekly, weekly-Fable. Costs nothing and does NOT anchor
+a usage window.
+
+Keychain services: default account -> "Claude Code-credentials"; other config
+dirs -> "Claude Code-credentials-<first 8 hex of sha256(config dir path)>".
+
+Resilience (added 2026-09-06, after a run failed on two of three accounts):
+  * transient network faults (connection reset, timeout, 5xx, 429) are retried
+    with backoff instead of being reported as a dead account;
+  * an expired access token is healed automatically — `claude auth status`
+    on that account refreshes it, then the fetch is retried. When that account
+    already has a live session we just re-read the keychain instead of running
+    the CLI, so two processes never race on one .claude.json.
+"""
+
+import argparse, hashlib, json, os, subprocess, sys, time
+import urllib.error, urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+
+ACCOUNTS = [
+    ("default", "/Users/bgg/.claude", None),
+    ("benjr",   "/Users/bgg/.claude-benjr", "/Users/bgg/.claude-benjr"),
+    ("bggai",   "/Users/bgg/.claude-bggai", "/Users/bgg/.claude-bggai"),
+]
+
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+RETRY_CODES = {408, 425, 429, 500, 502, 503, 504}
+BACKOFF = (0.4, 1.2, 3.0)          # one entry per retry after the first attempt
+CLOCK_SKEW = 60                    # treat a token expiring within a minute as expired
+
+BOLD, DIM, RED, YEL, GRN, RST = "\033[1m", "\033[2m", "\033[31m", "\033[33m", "\033[32m", "\033[0m"
+CYN = "\033[96m"  # bright cyan — session (5h) bar, the one that matters day-to-day
+
+
+# ---------------------------------------------------------------- keychain ---
+def keychain_service(suffix_dir):
+    if suffix_dir is None:
+        return "Claude Code-credentials"
+    h = hashlib.sha256(suffix_dir.encode()).hexdigest()[:8]
+    return f"Claude Code-credentials-{h}"
+
+
+def read_oauth(suffix_dir):
+    """-> (payload dict, None) | (None, reason)."""
+    r = subprocess.run(["security", "find-generic-password", "-s",
+                        keychain_service(suffix_dir), "-w"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return None, "no keychain entry — log in with this account once"
+    try:
+        return json.loads(r.stdout)["claudeAiOauth"], None
+    except Exception as e:
+        return None, f"bad keychain payload ({e})"
+
+
+def expiry_state(payload):
+    """-> (is_expired, human note). expiresAt is epoch milliseconds."""
+    exp = (payload or {}).get("expiresAt")
+    if not exp:
+        return False, ""
+    delta = exp / 1000 - time.time()
+    if delta > CLOCK_SKEW:
+        return False, ""
+    return True, f"access token expired {human_delta(-delta)} ago"
+
+
+def human_delta(secs):
+    secs = max(0, int(secs))
+    if secs < 90:
+        return f"{secs}s"
+    if secs < 5400:
+        return f"{secs // 60}m"
+    return f"{secs // 3600}h{(secs % 3600) // 60:02d}m"
+
+
+# ------------------------------------------------------------------- state ---
+def get_email(cfg_dir):
+    try:
+        j = json.load(open(cfg_dir + "/.claude.json"))
+        return (j.get("oauthAccount") or {}).get("emailAddress", "?")
+    except Exception:
+        return "?"
+
+
+def refresh_token(cfg_dir, suffix_dir):
+    """Ask the CLI itself to refresh this account's OAuth token.
+
+    `claude auth status --json` is non-interactive, costs nothing, does not
+    anchor a usage window and — measured 2026-09-06, sha AND mtime unchanged —
+    does not write .claude.json. So it is safe to run even while that account
+    has a live interactive session; the usual "two processes clobber one
+    .claude.json" rule does not apply to this command.
+    """
+    env = dict(os.environ)
+    # The default account must be invoked WITHOUT CLAUDE_CONFIG_DIR: setting it
+    # makes the CLI look up a path-suffixed keychain entry and report "not logged in".
+    env.pop("CLAUDE_CONFIG_DIR", None)
+    if suffix_dir is not None:
+        env["CLAUDE_CONFIG_DIR"] = suffix_dir
+    try:
+        subprocess.run(["claude", "auth", "status", "--json"], env=env,
+                       capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return "claude auth status"
+
+
+# ------------------------------------------------------------------- fetch ---
+def _get(token):
+    req = urllib.request.Request(
+        USAGE_URL,
+        headers={"Authorization": f"Bearer {token}",
+                 "anthropic-beta": "oauth-2025-04-20",
+                 "anthropic-version": "2023-06-01"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.load(r)
+
+
+def fetch_usage(token, attempts=3):
+    """-> (usage, retries). Retries transient faults; 401/403 raise immediately."""
+    for i in range(attempts):
+        try:
+            return _get(token), i
+        except urllib.error.HTTPError as e:
+            err, transient = e, e.code in RETRY_CODES
+        except OSError as e:                 # URLError, connection reset, timeout
+            err, transient = e, True
+        # `raise` alone would run outside the handler, where there is no active
+        # exception — re-raise the captured one.
+        if not transient or i == attempts - 1:
+            raise err
+        time.sleep(BACKOFF[min(i, len(BACKOFF) - 1)])
+
+
+def collect(account):
+    """Everything network-bound for one account. -> (label, email, lines, ok)."""
+    label, cfg_dir, suffix_dir = account
+    email = get_email(cfg_dir)
+    payload, err = read_oauth(suffix_dir)
+    if not payload:
+        return label, email, [f"  {RED}✗ {err}{RST}"], False
+
+    notes, healed = [], None
+    expired, why = expiry_state(payload)
+    if expired:                              # skip the call we know would 401
+        healed = refresh_token(cfg_dir, suffix_dir)
+        payload, err = read_oauth(suffix_dir)
+        if not payload:
+            return label, email, [f"  {RED}✗ {err}{RST}"], False
+        if expiry_state(payload)[0]:
+            return label, email, [f"  {RED}✗ {why}; refresh did not renew it "
+                                  f"— run `claude auth login` on this account{RST}"], False
+
+    try:
+        usage, retries = fetch_usage(payload["accessToken"])
+    except urllib.error.HTTPError as e:
+        if e.code not in (401, 403):
+            return label, email, [f"  {RED}✗ HTTP {e.code}{RST}"], False
+        # Token was rejected: refresh once (unless we already did) and retry.
+        if healed is None:
+            healed = refresh_token(cfg_dir, suffix_dir)
+        payload, _ = read_oauth(suffix_dir)
+        try:
+            usage, retries = fetch_usage((payload or {}).get("accessToken") or "")
+        except Exception as e2:
+            detail = f"HTTP {e2.code}" if isinstance(e2, urllib.error.HTTPError) else e2
+            hint = " — run `claude auth login` on this account"
+            return label, email, [f"  {RED}✗ {detail} after refresh{hint}{RST}"], False
+        notes.append("refreshed token")
+    except Exception as e:
+        return label, email, [f"  {RED}✗ {e}{RST}"], False
+
+    if retries:
+        notes.append(f"retried {retries}×")
+    if healed and "refreshed token" not in notes:
+        notes.append("refreshed token")
+
+    lines = []
+    for l in usage.get("limits", []):
+        pct = l.get("percent") or 0
+        active = f" {RED}◀ LIMITED{RST}" if l.get("is_active") and pct >= 100 else ""
+        base = CYN if l["kind"] == "session" else GRN
+        lines.append(f"  {limit_label(l):<14} {bar(pct, base=base)} {pct:>3}%  "
+                     f"{DIM}{fmt_reset(l.get('resets_at'))}{RST}{active}")
+    if not lines:
+        lines.append(f"  {DIM}(no limits reported){RST}")
+    extra = usage.get("extra_usage") or {}
+    if extra.get("is_enabled"):
+        lines.append(f"  {DIM}extra usage on: {extra.get('used_credits', 0)} used{RST}")
+    if notes:
+        lines.append(f"  {DIM}↺ {', '.join(notes)}{RST}")
+    return label, email, lines, True
+
+
+# ------------------------------------------------------------------ render ---
+def fmt_reset(iso):
+    if not iso:
+        return ""
+    try:
+        t = datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone()
+    except ValueError:
+        return ""
+    now = datetime.now(timezone.utc).astimezone()
+    day = "" if t.date() == now.date() else t.strftime("%a ")
+    return f"resets {day}{t.strftime('%H:%M')}"
+
+
+def bar(pct, width=20, base=GRN):
+    filled = min(width, round(pct / 100 * width))
+    color = base if pct < 60 else YEL if pct < 85 else RED
+    return f"{color}{'█' * filled}{DIM}{'░' * (width - filled)}{RST}"
+
+
+def limit_label(l):
+    if l["kind"] == "session":
+        return "session (5h)"
+    if l["kind"] == "weekly_all":
+        return "weekly"
+    scope = ((l.get("scope") or {}).get("model") or {}).get("display_name")
+    return f"weekly {scope}" if scope else l["kind"]
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Usage limits for every Claude account.")
+    ap.add_argument("accounts", nargs="*", metavar="ACCOUNT",
+                    help="only these accounts (default: all)")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    args = ap.parse_args()
+
+    wanted = ACCOUNTS
+    if args.accounts:
+        pick = {a.lower() for a in args.accounts}
+        wanted = [a for a in ACCOUNTS if a[0].lower() in pick]
+        if not wanted:
+            print(f"no such account: {', '.join(args.accounts)}", file=sys.stderr)
+            return 2
+
+    if args.json:
+        out, failed = {}, False
+        for label, cfg_dir, suffix_dir in wanted:
+            payload, err = read_oauth(suffix_dir)
+            if not payload:
+                out[label] = {"error": err}; failed = True; continue
+            try:
+                usage, _ = fetch_usage(payload["accessToken"])
+                out[label] = {"email": get_email(cfg_dir), **usage}
+            except Exception as e:
+                out[label] = {"error": str(e)}; failed = True
+        print(json.dumps(out, indent=2))
+        return 1 if failed else 0
+
+    # One account's slow retry must not hold up the others.
+    with ThreadPoolExecutor(max_workers=max(1, len(wanted))) as pool:
+        results = list(pool.map(collect, wanted))
+
+    failed = False
+    for label, email, lines, ok in results:
+        print(f"\n{BOLD}{label}{RST} {DIM}{email}{RST}")
+        for line in lines:
+            print(line)
+        failed |= not ok
+    print()
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
