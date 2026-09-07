@@ -216,17 +216,39 @@ def session_reset_at(account):
     return None, "no session limit in response"
 
 
+DELAY_CHOICES = (0, 5, 10, 15, 20, 25, 30)
+
+
 def parse_clock(s):
-    """'5:40am' / '11pm' -> next future datetime with that wall time."""
-    m = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)", s.strip().lower())
-    if not m:
-        raise ValueError(f"can't parse time {s!r} — use forms like 5:40am, 11pm")
+    """A real datetime, not a string. Accepts:
+      '5:40am' / '11pm'        (12-hour wall time)
+      '05:40' / '17:40'        (24-hour wall time)
+      '2026-09-07T05:40'       (full datetime, e.g. from a datetime picker)
+    Wall times resolve to their NEXT future occurrence; full datetimes must be
+    in the future."""
+    s = s.strip().lower()
+    now = datetime.now()
+    if "t" in s or "-" in s:               # full datetime (datetime-local / ISO)
+        try:
+            t = datetime.fromisoformat(s.upper().replace("Z", "+00:00"))
+        except ValueError:
+            raise ValueError(f"invalid datetime {s!r} — expected YYYY-MM-DDTHH:MM")
+        if t.tzinfo:
+            t = t.astimezone().replace(tzinfo=None)
+        if t <= now:
+            raise ValueError(f"{t:%Y-%m-%d %H:%M} is in the past")
+        return t
+    m = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", s)
+    if not m or (m.group(2) is None and m.group(3) is None):
+        raise ValueError(f"invalid time {s!r} — use 5:40am, 17:40, "
+                         f"or a full YYYY-MM-DDTHH:MM")
     h, mi, ap = int(m.group(1)), int(m.group(2) or 0), m.group(3)
     if ap == "pm" and h != 12:
         h += 12
     if ap == "am" and h == 12:
         h = 0
-    now = datetime.now()
+    if not (0 <= h <= 23 and 0 <= mi <= 59):
+        raise ValueError(f"invalid time {s!r}")
     t = now.replace(hour=h, minute=mi, second=0, microsecond=0)
     if t <= now:
         t += timedelta(days=1)
@@ -408,17 +430,21 @@ def cmd_wizard(_a=None):
 
     detected, info = session_reset_at(acct)
     if detected and detected > datetime.now():
-        print(f"\n  detected reset: {detected:%a %H:%M} ({info})")
-        reset = ask("reset", "auto",
-                    lambda v: v == "auto" or parse_clock(v))
+        print(f"\n  detected reset: {detected:%a %d %H:%M} ({info})")
+        reset = ask("reset (Enter = detected)",
+                    detected.strftime("%Y-%m-%dT%H:%M"), parse_clock)
     else:
         why = info if not detected else f"{detected:%H:%M} already past"
-        print(f"\n  ! couldn't use auto reset ({why}) — give the reset time "
+        print(f"\n  ! couldn't auto-detect ({why}) — give the reset time "
               f"from the limit banner")
-        reset = ask("reset (e.g. 5:40am)", None, parse_clock)
+        reset = ask("reset (5:40am / 17:40 / YYYY-MM-DDTHH:MM)", None, parse_clock)
+    print(f"    → reset at {parse_clock(reset):%a %d %b %H:%M}")
 
-    delay = int(ask("delay after reset, minutes", "5",
-                    lambda v: int(v) >= 0 or True))
+    def vdelay(v):
+        if int(v) not in DELAY_CHOICES:
+            raise ValueError(f"pick one of {', '.join(map(str, DELAY_CHOICES))}")
+    delay = int(ask(f"delay after reset, minutes ({'/'.join(map(str, DELAY_CHOICES))})",
+                    "5", vdelay))
     fu = ask("follow-up (+5h5m / 10:50am / off)", "+5h5m",
              lambda v: parse_followup(v, datetime.now()))
     msg = ask("continue message", DEFAULT_CONTINUE[:44] + "…")
@@ -474,10 +500,16 @@ def cmd_add(a):
             sys.exit(f"detected reset {reset_at:%H:%M} is already past — the "
                      f"account is usable now; just continue the session yourself.")
     else:
-        reset_at = parse_clock(a.reset)
+        try:
+            reset_at = parse_clock(a.reset)
+        except ValueError as e:
+            sys.exit(f"✗ {e}")
 
     continue_at = reset_at + timedelta(minutes=a.delay)
-    followup_at = parse_followup(a.follow_up, continue_at)
+    try:
+        followup_at = parse_followup(a.follow_up, continue_at)
+    except ValueError as e:
+        sys.exit(f"✗ {e}")
 
     actions = [{"kind": "continue", "at": continue_at.isoformat(timespec="seconds"),
                 "message": a.message, "retries": 0, "done": False}]
@@ -502,6 +534,18 @@ def cmd_add(a):
         plan += f", follow-up @ {followup_at:%a %H:%M}"
     log(f"added {a.account}/{a.session} ({path}): {plan} (expires in {a.ttl}h)")
     ensure_daemon()
+
+
+def cmd_detect(a):
+    dt, info = session_reset_at(a.account)
+    if a.json:
+        print(json.dumps({"account": a.account,
+                          "reset_at": dt.strftime("%Y-%m-%dT%H:%M") if dt else None,
+                          "info": info}))
+    elif dt:
+        print(f"{a.account}: session resets {dt:%a %d %b %H:%M} ({info})")
+    else:
+        print(f"{a.account}: {info}")
 
 
 def cmd_list(_a):
@@ -574,7 +618,9 @@ def main():
     p.add_argument("--reset", default="auto",
                    help="'auto' (query the usage API, default) or HH:MMam")
     p.add_argument("--delay", type=int, default=5, metavar="MIN",
-                   help="minutes after reset to send the continue (default 5)")
+                   choices=DELAY_CHOICES,
+                   help="minutes after reset to send the continue "
+                        "(0-30 in steps of 5; default 5; 0 = immediately)")
     p.add_argument("--follow-up", default="+5h5m", metavar="WHEN",
                    help="anchor message: '+5h5m' after continue (default), "
                         "a clock time like 10:50am, or 'off'")
@@ -588,6 +634,11 @@ def main():
 
     p = sub.add_parser("setup", help="interactive setup wizard (same as no args)")
     p.set_defaults(fn=cmd_wizard)
+
+    p = sub.add_parser("detect", help="print an account's session reset time")
+    p.add_argument("account", choices=list(ACCOUNTS))
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_detect)
 
     p = sub.add_parser("list", help="show pending tasks and daemon state")
     p.set_defaults(fn=cmd_list)

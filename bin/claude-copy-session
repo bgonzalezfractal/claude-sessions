@@ -63,13 +63,22 @@ def sessions_on(cfg_dir):
     return out
 
 
-def resolve(cfg_dir, ref):
+def slug(path):
+    return re.sub(r"[^A-Za-z0-9]", "-", path)
+
+
+def resolve(cfg_dir, ref, path=None):
     if UUID_RE.match(ref):
         return ref
     hits = {sid: s for sid, s in sessions_on(cfg_dir).items()
             if s.get("title") == ref}
+    if path:  # origin path filter: live cwd or the transcript's project key
+        p = os.path.realpath(os.path.expanduser(path))
+        hits = {sid: s for sid, s in hits.items()
+                if s.get("cwd") == p or s.get("project") == slug(p)}
     if not hits:
-        sys.exit(f"no session titled {ref!r} on that account — "
+        where = f" under {path}" if path else ""
+        sys.exit(f"no session titled {ref!r}{where} on that account — "
                  f"try `claude-copy-session --list <alias>`")
     if len(hits) > 1:
         # newest transcript wins, but say so
@@ -90,6 +99,10 @@ def main():
     ap.add_argument("src", nargs="?", help="source account alias")
     ap.add_argument("dst", nargs="?", help="destination account alias")
     ap.add_argument("session", nargs="?", help="session title (or uuid)")
+    ap.add_argument("--path", help="origin path — picks the session living there "
+                                   "when a title exists in several projects")
+    ap.add_argument("--to-path", help="destination path — re-home the copy into "
+                                      "a different working directory")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
     accounts = discover_accounts()
@@ -117,10 +130,15 @@ def main():
     if a.src == a.dst:
         sys.exit("src and dst are the same account")
 
-    sid = resolve(accounts[a.src], a.session)
+    sid = resolve(accounts[a.src], a.session, a.path)
     cmd = [MIGRATE, accounts[a.src], accounts[a.dst], sid]
     if a.dry_run:
         cmd.append("--dry-run")
+    if a.to_path:
+        p = os.path.realpath(os.path.expanduser(a.to_path))
+        if not os.path.isdir(p):
+            sys.exit(f"--to-path is not a directory: {p}")
+        cmd += ["--dst-cwd", p]
     r = subprocess.run(cmd)
     if r.returncode == 0 and not a.dry_run:
         print("\nReminders: exit the source session (a copy is a fork); "

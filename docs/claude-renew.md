@@ -35,8 +35,9 @@ claude-renew add bggai radal-v2 --path ~/Documents/repos/radal/radal-app
 
 # Personalize everything:
 claude-renew add default clay \
-    --reset 5:40am \                 # explicit instead of auto
-    --delay 5 \                      # minutes after reset for the continue
+    --reset 5:40am \                 # or 17:40, or 2026-09-08T05:40 (real datetime,
+                                     #  validated — past times rejected)
+    --delay 10 \                     # 0-30 in steps of 5 (0 = immediately)
     --follow-up +5h5m \              # or a clock time (10:50am), or 'off'
     --message "continue the migration task" \
     --follow-up-message "hi" \
@@ -53,6 +54,10 @@ Accounts: `default` | `benjr` | `bggai`.
 
 ## Semantics
 
+- **Reset time is a real datetime**: `5:40am`, `17:40`, or `YYYY-MM-DDTHH:MM`;
+  wall times resolve to their next future occurrence, past datetimes are
+  rejected with a clean error. The wizard pre-fills the **detected** reset as
+  the default value. `claude-renew detect <account> [--json]` prints it alone.
 - **`--reset auto`** (default) reads the account's OAuth token from the keychain
   and GETs `api/oauth/usage`; the session limit's `resets_at` is the exact
   renewal moment (better than parsing the "resets 5:40am" banner). Read-only —

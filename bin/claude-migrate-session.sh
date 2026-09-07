@@ -2,7 +2,8 @@
 # Copy a Claude Code session (transcript + all sidecar state) from one config dir
 # (alias/account) to another, keeping the same session id so it can be resumed.
 #
-#   claude-migrate-session.sh <src-config-dir> <dst-config-dir> <session-id> [--dry-run]
+#   claude-migrate-session.sh <src-config-dir> <dst-config-dir> <session-id> \
+#       [--dry-run] [--dst-cwd <path>]     # --dst-cwd re-homes the copy
 #
 # Docs, gotchas and verification steps: ./session_migration.md
 #
@@ -13,7 +14,15 @@ set -euo pipefail
 SRC="${1:?src config dir, e.g. ~/.claude}"
 DST="${2:?dst config dir, e.g. ~/.claude-bggai}"
 SID="${3:?session id (uuid)}"
-DRY="${4:-}"
+shift 3
+DRY=""; DST_CWD_OVERRIDE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY="--dry-run"; shift ;;
+    --dst-cwd) DST_CWD_OVERRIDE="${2:?--dst-cwd needs a path}"; shift 2 ;;
+    *) echo "unknown arg: $1" >&2; exit 1 ;;
+  esac
+done
 RS=(rsync -a)
 [ "$DRY" = "--dry-run" ] && RS=(rsync -a --dry-run -v) && echo "*** DRY RUN ***"
 
@@ -69,9 +78,16 @@ for line in open(sys.argv[1]):
 print(t)
 PY
 )"
+# Optional re-home: land the copy under a different working directory in the
+# destination (gotcha #5 — the transcript keeps old cwd values, but the resumed
+# session records the new cwd going forward and files under the new project key).
+DST_CWD="${DST_CWD_OVERRIDE:-$CWD}"
+DST_KEY="$(python3 -c "import re,sys;print(re.sub(r'[^A-Za-z0-9]','-',sys.argv[1]))" "$DST_CWD")"
+
 echo "session : $SID  ($TITLE)"
 echo "project : $PROJ_KEY"
 echo "cwd     : $CWD"
+[ "$DST_CWD" != "$CWD" ] && echo "re-home : $DST_CWD  (project key $DST_KEY)"
 echo "src->dst: $SRC -> $DST"
 echo "config  : $SRC_JSON -> $DST_JSON"
 echo
@@ -91,19 +107,19 @@ for sj in "$SRC"/sessions/*.json "$DST"/sessions/*.json; do
 done
 
 # ---- 0. guard: don't silently clobber an existing copy -----------------------
-DST_T="$DST/projects/$PROJ_KEY/$SID.jsonl"
+DST_T="$DST/projects/$DST_KEY/$SID.jsonl"
 if [ -f "$DST_T" ] && [ "$DRY" != "--dry-run" ]; then
   STAMP="$(date +%Y%m%d-%H%M)"
   echo "[0/6] dst copy exists -> backing up as *.bak-$STAMP"
   cp -p "$DST_T" "$DST_T.bak-$STAMP"
-  [ -d "$DST/projects/$PROJ_KEY/$SID" ] && cp -Rp "$DST/projects/$PROJ_KEY/$SID" "$DST/projects/$PROJ_KEY/$SID.bak-$STAMP"
+  [ -d "$DST/projects/$DST_KEY/$SID" ] && cp -Rp "$DST/projects/$DST_KEY/$SID" "$DST/projects/$DST_KEY/$SID.bak-$STAMP"
 fi
 
 # ---- 1. transcript + per-session sidecar (subagents/, workflows/, tool-results/)
-mkdir -p "$DST/projects/$PROJ_KEY"
+mkdir -p "$DST/projects/$DST_KEY"
 echo "[1/6] transcript + sidecar dirs"
-"${RS[@]}" "$TRANSCRIPT" "$DST/projects/$PROJ_KEY/"
-[ -d "$PROJ_DIR/$SID" ] && "${RS[@]}" "$PROJ_DIR/$SID/" "$DST/projects/$PROJ_KEY/$SID/"
+"${RS[@]}" "$TRANSCRIPT" "$DST/projects/$DST_KEY/"
+[ -d "$PROJ_DIR/$SID" ] && "${RS[@]}" "$PROJ_DIR/$SID/" "$DST/projects/$DST_KEY/$SID/"
 
 # ---- 2. project memory (MEMORY.md + memory files) ---------------------------
 # ADDITIVE: the destination account has its own memory for this project. Never
@@ -111,12 +127,12 @@ echo "[1/6] transcript + sidecar dirs"
 # usually the richer one) — copy only the new files and merge the index lines.
 if [ -d "$PROJ_DIR/memory" ]; then
   echo "[2/6] project memory ($(ls "$PROJ_DIR/memory" | wc -l | tr -d ' ') files, additive)"
-  mkdir -p "$DST/projects/$PROJ_KEY/memory"
-  "${RS[@]}" --ignore-existing "$PROJ_DIR/memory/" "$DST/projects/$PROJ_KEY/memory/"
+  mkdir -p "$DST/projects/$DST_KEY/memory"
+  "${RS[@]}" --ignore-existing "$PROJ_DIR/memory/" "$DST/projects/$DST_KEY/memory/"
   if [ "$DRY" = "--dry-run" ]; then
     echo "      would merge MEMORY.md pointer lines"
   else
-    python3 - "$PROJ_DIR/memory" "$DST/projects/$PROJ_KEY/memory" <<'PY'
+    python3 - "$PROJ_DIR/memory" "$DST/projects/$DST_KEY/memory" <<'PY'
 import os,re,shutil,sys
 src,dst=sys.argv[1:3]
 si,di=os.path.join(src,"MEMORY.md"),os.path.join(dst,"MEMORY.md")
@@ -170,9 +186,9 @@ fi
 # ---- 5. .claude.json project entry (trust, allowedTools, mcp, ignorePatterns)
 echo "[5/6] .claude.json project entry"
 if [ "$DRY" != "--dry-run" ]; then
-  python3 - "$SRC_JSON" "$DST_JSON" "$CWD" <<'PY'
+  python3 - "$SRC_JSON" "$DST_JSON" "$CWD" "$DST_CWD" <<'PY'
 import json,sys,os,shutil
-src,dst,cwd=sys.argv[1:4]
+src,dst,cwd,dst_cwd=sys.argv[1:5]
 if not (os.path.exists(src) and os.path.exists(dst)): sys.exit(0)
 s=json.load(open(src)); d=json.load(open(dst))
 sp=s.get("projects",{}).get(cwd)
@@ -181,7 +197,7 @@ KEEP=["allowedTools","mcpContextUris","mcpServers","enabledMcpjsonServers",
       "disabledMcpjsonServers","disabledMcpServers","hasTrustDialogAccepted",
       "ignorePatterns","hasClaudeMdExternalIncludesApproved","exampleFiles",
       "exampleFilesGeneratedAt","projectOnboardingSeenCount"]
-tgt=d.setdefault("projects",{}).setdefault(cwd,{})
+tgt=d.setdefault("projects",{}).setdefault(dst_cwd,{})
 added=[]
 for k in KEEP:
     if k in sp and k not in tgt:
@@ -199,7 +215,7 @@ echo "[6/6] done"
 echo
 echo "Resume with:"
 if [ "$DST" = "$HOME/.claude" ]; then
-  echo "  cd $CWD && claude --resume $SID"
+  echo "  cd $DST_CWD && claude --resume $SID"
 else
-  echo "  cd $CWD && CLAUDE_CONFIG_DIR=$DST claude --resume $SID"
+  echo "  cd $DST_CWD && CLAUDE_CONFIG_DIR=$DST claude --resume $SID"
 fi
