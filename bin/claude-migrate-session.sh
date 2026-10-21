@@ -120,6 +120,21 @@ mkdir -p "$DST/projects/$DST_KEY"
 echo "[1/6] transcript + sidecar dirs"
 "${RS[@]}" "$TRANSCRIPT" "$DST/projects/$DST_KEY/"
 [ -d "$PROJ_DIR/$SID" ] && "${RS[@]}" "$PROJ_DIR/$SID/" "$DST/projects/$DST_KEY/$SID/"
+# A session that ran tools from subdirectories can leave sidecars under OTHER
+# project keys too (e.g. a Workflow launched while cd'd into frontend/ writes
+# its scriptPath under <proj>-frontend/<sid>/workflows/scripts/). The transcript
+# references those absolute paths, so copy each one under the same key
+# (hit 2026-10-05: a backend workflow's script lived only under -frontend).
+EXTRA_SIDECARS=()
+for d in "$SRC"/projects/*/"$SID"; do
+  [ -d "$d" ] || continue
+  k="$(basename "$(dirname "$d")")"
+  [ "$k" = "$PROJ_KEY" ] && continue
+  echo "      + extra sidecar under $k"
+  mkdir -p "$DST/projects/$k/$SID"
+  "${RS[@]}" "$d/" "$DST/projects/$k/$SID/"
+  EXTRA_SIDECARS+=("$DST/projects/$k/$SID")
+done
 
 # ---- 1b. rewrite absolute config-dir paths inside the copy -------------------
 # Tool results, workflow journals and scripts record absolute paths under the
@@ -130,13 +145,14 @@ echo "[1/6] transcript + sidecar dirs"
 # ~/.claude would also mangle ~/.claude-benjr paths.
 if [ "$DRY" != "--dry-run" ]; then
   echo "[1b/6] rewrite $SRC/ -> $DST/ inside the copy"
-  python3 - "$SRC/" "$DST/" "$DST/projects/$DST_KEY/$SID.jsonl" "$DST/projects/$DST_KEY/$SID" <<'PY'
+  python3 - "$SRC/" "$DST/" "$DST/projects/$DST_KEY/$SID.jsonl" "$DST/projects/$DST_KEY/$SID" ${EXTRA_SIDECARS[@]+"${EXTRA_SIDECARS[@]}"} <<'PY'
 import os, sys
-src, dst, transcript, sidecar = sys.argv[1:5]
+src, dst, transcript = sys.argv[1:4]
 targets = [transcript]
-for root, _, files in os.walk(sidecar):
-    targets += [os.path.join(root, f) for f in files
-                if f.endswith((".json", ".jsonl", ".js", ".md", ".txt"))]
+for sidecar in sys.argv[4:]:
+    for root, _, files in os.walk(sidecar):
+        targets += [os.path.join(root, f) for f in files
+                    if f.endswith((".json", ".jsonl", ".js", ".md", ".txt"))]
 n = 0
 for p in targets:
     if not os.path.isfile(p):

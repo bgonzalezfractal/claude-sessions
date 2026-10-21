@@ -1,71 +1,74 @@
 #!/usr/bin/env python3
 """
-claude-renew — resume an interrupted session the moment its limit renews.
+agentctl renew — resume an interrupted session the moment its limit renews.
+
+Works for every provider agentctl knows (Claude Code and Codex): accounts are
+addressed by their unique label ("default", "benjr", "bggai", "codex"), and the
+provider behind that label does the delivery.
 
 The scenario: a session runs out at 2–3 AM mid-task and renews at, say, 5:40 AM.
 You go to bed. Because the work was interrupted, waiting for the 7:30 morning
 anchor wastes the 5:40 renewal. So you register the session before bed:
 
-    claude-renew add bggai radal-v2 --path ~/Documents/repos/radal/radal-app
+    agentctl renew add codex new-acp --query "Continue, and consider ..."
 
 and the daemon (24 h, self-expiring) will:
   1. at reset + 5 min (5:45) message the live session to CONTINUE its pending task;
-  2. at continue + 5 h 05 m (10:50) send a follow-up "hi" that anchors the next
-     window at the earliest possible moment of your day.
+  2. at continue + 5 h 05 m (10:50) send a follow-up anchor ping that opens the
+     next window at the earliest possible moment of your day.
 
-If nothing was interrupted, don't register — the morning limit-reset job
+If nothing was interrupted, don't register — the morning anchor job
 (7:30 weekdays / 10:30 weekends) already anchors the day.
 
 Every timing and message is personalizable per task; `remove` cancels pending
-tasks. Run `claude-renew --help` / `claude-renew add --help`.
+tasks. Run `agentctl renew --help` / `agentctl renew add --help`.
 
-Mechanics (validated live 2026-09-06):
+Mechanics:
   * Sessions are addressed by their /rename alias and must be LIVE (terminal
-    open). They are found in <config>/sessions/<pid>.json; --path additionally
-    pins the session's working directory.
-  * Delivery is a headless `claude -p --model haiku` helper on the SAME account
-    (peer visibility is per config dir) using ListAgents + SendMessage. The
-    prompt goes via stdin because --allowedTools is variadic.
-  * The default account runs WITHOUT CLAUDE_CONFIG_DIR (keychain gotcha).
-  * `--reset auto` (the default) reads the account's OAuth token from the macOS
-    keychain and GETs api/oauth/usage — the exact session `resets_at`, read-only,
-    no window anchored.
+    open); `--path` additionally pins the session's working directory.
+  * Delivery is the provider's job (providers/__init__.py contract):
+      - codex  : `codex queue --thread <name> --message TEXT` (built in, no
+                 helper model involved);
+      - claude : a headless `claude -p --model haiku` helper on the SAME account
+                 using ListAgents + SendMessage (peer visibility is per config
+                 dir; the default account runs WITHOUT CLAUDE_CONFIG_DIR).
+  * `--reset auto` (the default) asks the provider for the exact session
+    `resets_at` — read-only, no window anchored.
+  * The follow-up is a window anchor only: a separate throwaway ping on the
+    account (`claude -p --model haiku` / `codex exec --ephemeral`), never
+    touching the working session, which runs on its own (expensive) model.
 """
 
-import argparse, glob, hashlib, json, os, re, subprocess, sys, time
-import urllib.error, urllib.request
-from datetime import datetime, timedelta, timezone
+import argparse, json, os, re, subprocess, sys, time
+from datetime import datetime, timedelta
 
-HOME = os.path.expanduser("~")
-BASE = os.path.join(HOME, ".claude", "claude-renew")
-REGISTRY = os.path.join(BASE, "registry.json")
-PIDFILE = os.path.join(BASE, "daemon.pid")
-LOG = os.path.join(BASE, "renew.log")
-CLAUDE_BIN = "/opt/homebrew/bin/claude"
-USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+from agentctl import HOME, RENEW_DIR, RENEW_REGISTRY, RENEW_PIDFILE, RENEW_LOG
+from agentctl.providers import discover_accounts, get_account, provider_of
 
-def discover_accounts():
-    """default + every logged-in ~/.claude-* dir. Value None => run without
-    CLAUDE_CONFIG_DIR (the default-account keychain gotcha)."""
-    accounts = {"default": None}
-    for d in sorted(glob.glob(os.path.join(HOME, ".claude-*"))):
-        if os.path.isfile(os.path.join(d, ".claude.json")):
-            accounts[os.path.basename(d)[len(".claude-"):]] = d
-    return accounts
+BASE = RENEW_DIR
+REGISTRY = RENEW_REGISTRY
+PIDFILE = RENEW_PIDFILE
+LOG = RENEW_LOG
+LEGACY_REGISTRY = os.path.join(HOME, ".claude", "claude-renew", "registry.json")
 
-
-ACCOUNTS = discover_accounts()
-
-DEFAULT_CONTINUE = ("Your usage limit has reset (scheduled auto-continue). "
-                    "Please continue with the pending task exactly where you left off.")
-# The follow-up is a window anchor only: it runs as a SEPARATE throwaway
-# `claude -p --model haiku` ping on the account (like the morning job), never
-# touching the working session — which runs on its own (expensive) model.
+PREFIX = "Your usage limit has reset (scheduled auto-continue by agentctl). "
+DEFAULT_CONTINUE = "Continue with the pending task exactly where you left off."
 DEFAULT_FOLLOWUP = "Hello, only answer hello"
 
 TICK_SECONDS = 30
 RETRY_MINUTES = 10
 MAX_RETRIES = 8
+MAX_REARMS = 3          # re-schedules after a delivered continue died on the limit
+
+DELAY_CHOICES = (0, 5, 10, 15, 20, 25, 30)
+
+
+def continue_message(query=None, message=None):
+    """Default continue text, optionally extended with the user's own query.
+    `message` (--message) is a full verbatim override."""
+    if message:
+        return message
+    return PREFIX + (query.strip() if query else DEFAULT_CONTINUE)
 
 
 # ------------------------------------------------------------------ helpers ---
@@ -93,133 +96,37 @@ def save_registry(entries):
     os.replace(tmp, REGISTRY)
 
 
-def config_dir(account):
-    return ACCOUNTS[account] or os.path.join(HOME, ".claude")
-
-
-def account_env(account):
-    env = dict(os.environ)
-    env.pop("CLAUDE_CONFIG_DIR", None)
-    if ACCOUNTS[account]:
-        env["CLAUDE_CONFIG_DIR"] = ACCOUNTS[account]
-    return env
+def migrate_legacy():
+    """One-time: adopt ~/.claude/claude-renew/registry.json (claude-renew's
+    state) the first time agentctl runs. The old files are left in place."""
+    if os.path.exists(REGISTRY) or not os.path.isfile(LEGACY_REGISTRY):
+        return
+    try:
+        with open(LEGACY_REGISTRY) as f:
+            entries = json.load(f)
+    except Exception:
+        return
+    if not isinstance(entries, list) or not entries:
+        return                       # nothing worth adopting
+    for e in entries:
+        if isinstance(e, dict):
+            e.setdefault("provider", "claude")
+    save_registry(entries)
+    log(f"migrated {len(entries)} task(s) from {LEGACY_REGISTRY}")
 
 
 def norm_path(p):
     return os.path.realpath(os.path.expanduser(p)) if p else None
 
 
-def all_live_sessions(account):
-    """Every live session on the account: [{name, cwd, pid}] newest-first."""
-    sess_dir = os.path.join(config_dir(account), "sessions")
-    out = []
-    if not os.path.isdir(sess_dir):
-        return out
-    for fn in os.listdir(sess_dir):
-        if not fn.endswith(".json"):
-            continue
-        try:
-            j = json.load(open(os.path.join(sess_dir, fn)))
-            os.kill(j["pid"], 0)
-        except Exception:
-            continue
-        out.append({"name": j.get("name") or "(unnamed)", "cwd": j.get("cwd"),
-                    "pid": j["pid"], "started": j.get("startedAt", 0)})
-    return sorted(out, key=lambda s: -s["started"])
-
-
-def find_live_sessions(account, name, path=None):
-    """All live sessions with this name (and cwd, when path is given)."""
-    sess_dir = os.path.join(config_dir(account), "sessions")
-    hits = []
-    if not os.path.isdir(sess_dir):
-        return hits
-    for fn in os.listdir(sess_dir):
-        if not fn.endswith(".json"):
-            continue
-        try:
-            j = json.load(open(os.path.join(sess_dir, fn)))
-        except Exception:
-            continue
-        if j.get("name") != name:
-            continue
-        if path and norm_path(j.get("cwd")) != path:
-            continue
-        try:
-            os.kill(j["pid"], 0)
-        except Exception:
-            continue
-        hits.append(j)
-    return hits
-
-
-# ------------------------------------------- reset-time detection (read-only) ---
-def keychain_service(account):
-    d = ACCOUNTS[account]
-    if d is None:
-        return "Claude Code-credentials"
-    return "Claude Code-credentials-" + hashlib.sha256(d.encode()).hexdigest()[:8]
-
-
-def read_token(account):
-    r = subprocess.run(["security", "find-generic-password", "-s",
-                        keychain_service(account), "-w"],
-                       capture_output=True, text=True)
-    if r.returncode != 0:
-        return None
-    try:
-        return json.loads(r.stdout)["claudeAiOauth"]["accessToken"]
-    except Exception:
-        return None
-
-
-def refresh_token(account):
-    """`claude auth status --json` refreshes the token; measured safe to run
-    alongside a live session (it does not write .claude.json)."""
-    try:
-        subprocess.run([CLAUDE_BIN, "auth", "status", "--json"],
-                       env=account_env(account), capture_output=True,
-                       text=True, timeout=60)
-    except (OSError, subprocess.SubprocessError):
-        pass
-
-
-def session_reset_at(account):
-    """Exact local datetime the account's 5-hour session limit resets, plus the
-    limit's percent/is_active. Read-only; anchors nothing. -> (dt|None, info)."""
-    token = read_token(account)
-    if not token:
-        return None, "no keychain token"
-    for attempt in (1, 2):
-        req = urllib.request.Request(USAGE_URL, headers={
-            "Authorization": f"Bearer {token}",
-            "anthropic-beta": "oauth-2025-04-20",
-            "anthropic-version": "2023-06-01"})
-        try:
-            with urllib.request.urlopen(req, timeout=20) as r:
-                usage = json.load(r)
-            break
-        except urllib.error.HTTPError as e:
-            if e.code in (401, 403) and attempt == 1:
-                refresh_token(account)
-                token = read_token(account) or ""
-                continue
-            return None, f"HTTP {e.code}"
-        except OSError as e:
-            return None, str(e)
-    for l in usage.get("limits", []):
-        if l.get("kind") == "session":
-            iso = l.get("resets_at")
-            if not iso:
-                return None, "no active session window"
-            dt = datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone()
-            info = f"{l.get('percent', '?')}% used" + \
-                   (", LIMITED" if l.get("is_active") else "")
-            return dt.replace(tzinfo=None), info
-    return None, "no session limit in response"
-
-
-DELAY_CHOICES = (0, 5, 10, 15, 20, 25, 30)
+def resolve_account(label):
+    """Account dict for a label, or exit with the list of known labels."""
+    acct = get_account(label)
+    if not acct:
+        known = ", ".join(f"{a['label']} ({a['provider']})"
+                          for a in discover_accounts()) or "none logged in"
+        sys.exit(f"unknown account {label!r} — one of: {known}")
+    return acct
 
 
 def parse_clock(s):
@@ -275,52 +182,30 @@ def parse_followup(spec, continue_at):
 
 
 # ---------------------------------------------------------------- messaging ---
-def helper_prompt(session_name, message):
-    return (f"You are a scheduling helper. Use ListAgents to find the local session "
-            f"named '{session_name}', then use SendMessage to send it exactly this "
-            f"message: {json.dumps(message)}. Then output DONE. If no session with "
-            f"that name is listed, output NOT-FOUND plus the names you saw. "
-            f"Do nothing else.")
-
-
-def run_helper(account, cwd, prompt_text, timeout=300):
-    cmd = [CLAUDE_BIN, "-p", "--model", "haiku",
-           "--allowedTools", "ListAgents,SendMessage"]
-    try:
-        r = subprocess.run(cmd, input=prompt_text, text=True, env=account_env(account),
-                           cwd=cwd if cwd and os.path.isdir(cwd) else HOME,
-                           capture_output=True, timeout=timeout)
-        out = (r.stdout or "") + (r.stderr or "")
-        return r.returncode == 0, out.strip()
-    except subprocess.TimeoutExpired:
-        return False, "helper timed out"
-
-
 def fire(entry, action):
-    account, name, path = entry["account"], entry["session"], entry.get("path")
-    if action["kind"] == "follow-up":
-        # Anchor ping: a separate haiku one-shot on the account. Any request
-        # opens the window; the working session (on its own model) is left alone.
-        cmd = [CLAUDE_BIN, "-p", "--model", "haiku"]
-        try:
-            r = subprocess.run(cmd, input=action["message"], text=True,
-                               env=account_env(account),
-                               cwd=path if path and os.path.isdir(path) else HOME,
-                               capture_output=True, timeout=240)
-            out = ((r.stdout or "") + (r.stderr or "")).strip()
-        except subprocess.TimeoutExpired:
-            _reschedule(action, "anchor ping timed out")
-            return
-        if re.search(r"hit your session limit", out, re.I):
-            _reschedule(action, f"{account} still limited")
-        elif r.returncode == 0:
+    label, name, path = entry["account"], entry["session"], entry.get("path")
+    acct = get_account(label)
+    if not acct:
+        _reschedule(action, f"account {label!r} not found (logged out?)")
+        return
+    prov = provider_of(acct)
+
+    if action["kind"] in ("follow-up", "anchor"):
+        # Anchor ping: a separate throwaway request on the account. Any request
+        # opens the window; the working session is left alone.
+        status, out = prov.anchor_ping(acct, path)
+        out = (out or "").strip()
+        if status == "ok":
             action["done"] = True
-            log(f"FIRED follow-up (haiku anchor ping) -> {account}: "
+            log(f"FIRED {action['kind']} (anchor ping) -> {label}: "
                 f"{out[-120:].replace(chr(10), ' ')}")
+        elif status == "limited":
+            _reschedule(action, f"{label} still limited")
         else:
             _reschedule(action, f"anchor ping failed: {out[-150:]}")
         return
-    live = find_live_sessions(account, name, path)
+
+    live = prov.find_live_sessions(acct, name, path)
     if len(live) > 1:
         log(f"warning: {len(live)} live sessions named {name!r} — messaging by "
             f"name may hit either")
@@ -328,18 +213,56 @@ def fire(entry, action):
         _reschedule(action, f"session {name!r} not live"
                             + (f" at {path}" if path else ""))
         return
-    ok, out = run_helper(account, path or live[0].get("cwd"),
-                         helper_prompt(name, action["message"]))
-    tail = out[-200:].replace("\n", " ")
-    if ok and "DONE" in out:
+
+    status, detail = prov.send_message(acct, name, path or live[0].get("cwd"),
+                                       action["message"])
+    detail = (detail or "").strip()
+    tail = detail[-200:].replace("\n", " ")
+    if status == "sent-limited":
+        # Delivered, but its turn died on the usage limit, so the work never
+        # happened. Re-sending now would only stack a duplicate instruction on
+        # a session that already has it: close this action and arm a fresh one
+        # for the NEW reset instead.
         action["done"] = True
-        log(f"FIRED {action['kind']} -> {account}/{name}: {tail}")
-    elif re.search(r"hit your session limit", out, re.I):
-        _reschedule(action, f"{account} still limited")
-    elif "NOT-FOUND" in out:
-        _reschedule(action, f"helper couldn't see {name!r}: {tail}")
+        log(f"FIRED {action['kind']} -> {label}/{name}: {tail}")
+        _rearm(entry, action, acct, prov)
+    elif status == "sent":
+        action["done"] = True
+        log(f"FIRED {action['kind']} -> {label}/{name}: {tail}")
+    elif status == "not-live":
+        _reschedule(action, f"session {name!r} not live")
+    elif status == "limited":
+        _reschedule(action, f"{label} still limited")
     else:
-        _reschedule(action, f"helper failed: {tail}")
+        _reschedule(action, f"delivery failed: {detail[-150:]}")
+
+
+def _rearm(entry, action, acct, prov):
+    """Queue another continue at the account's next reset, after a delivered
+    message was killed by the limit. Bounded by MAX_REARMS."""
+    rearms = action.get("rearms", 0) + 1
+    if rearms > MAX_REARMS:
+        log(f"not re-arming {entry['account']}/{entry['session']} — "
+            f"{MAX_REARMS} continues in a row died on the usage limit")
+        return
+    reset_at, info = prov.session_reset_at(acct)
+    if not reset_at or reset_at <= datetime.now():
+        log(f"can't re-arm {entry['account']}/{entry['session']} — "
+            f"no future reset detected ({info})")
+        return
+    at = reset_at + timedelta(minutes=entry.get("delay", 5))
+    entry["reset_at"] = reset_at.isoformat(timespec="seconds")
+    # The entry's TTL must outlive the action it now carries, or the daemon
+    # would drop it before firing.
+    horizon = at + timedelta(hours=1)
+    if datetime.fromisoformat(entry["expires_at"]) < horizon:
+        entry["expires_at"] = horizon.isoformat(timespec="seconds")
+    entry["actions"].append({"kind": "continue",
+                             "at": at.isoformat(timespec="seconds"),
+                             "message": action["message"], "retries": 0,
+                             "rearms": rearms, "done": False})
+    log(f"re-armed continue {rearms}/{MAX_REARMS} for {entry['account']}/"
+        f"{entry['session']} @ {at:%a %H:%M} (turn hit the limit; {info})")
 
 
 def _reschedule(action, why):
@@ -354,6 +277,12 @@ def _reschedule(action, why):
 
 
 # ------------------------------------------------------------------- daemon ---
+def dispatcher():
+    """Path of bin/agentctl next to this package."""
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                        "bin", "agentctl")
+
+
 def ensure_daemon():
     try:
         pid = int(open(PIDFILE).read().strip())
@@ -361,7 +290,7 @@ def ensure_daemon():
         return
     except Exception:
         pass
-    p = subprocess.Popen([sys.executable, os.path.realpath(__file__), "run-daemon"],
+    p = subprocess.Popen([sys.executable, dispatcher(), "renew", "run-daemon"],
                          start_new_session=True,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     log(f"daemon spawned (pid {p.pid})")
@@ -369,6 +298,14 @@ def ensure_daemon():
 
 def cmd_run_daemon(_a):
     os.makedirs(BASE, exist_ok=True)
+    try:                                  # another daemon already owns the queue
+        running = int(open(PIDFILE).read().strip())
+        if running != os.getpid():
+            os.kill(running, 0)
+            log(f"daemon {os.getpid()} exiting — {running} already running")
+            return
+    except (OSError, ValueError):
+        pass
     with open(PIDFILE, "w") as f:
         f.write(str(os.getpid()))
     log(f"daemon started (pid {os.getpid()})")
@@ -399,11 +336,13 @@ def cmd_run_daemon(_a):
 
 
 # ------------------------------------------------------------------- wizard ---
-def ask(prompt, default=None, validate=None):
+def ask(prompt, default=None, validate=None, allow_empty=False):
     while True:
         sfx = f" [{default}]" if default not in (None, "") else ""
         v = input(f"  {prompt}{sfx}: ").strip() or (default or "")
         if not v:
+            if allow_empty:
+                return ""
             print("    ✗ required")
             continue
         if validate:
@@ -428,17 +367,23 @@ def pick(title, items, render):
 def cmd_wizard(_a=None):
     """Interactive, validated setup with every option defaulted."""
     if not sys.stdin.isatty():
-        sys.exit("no TTY — use: claude-renew add <account> <session> [options]")
-    print("── claude-renew · schedule an auto-continue ──")
+        sys.exit("no TTY — use: agentctl renew add <account> <session> [options]")
+    print("── agentctl renew · schedule an auto-continue ──")
 
-    rows = [(name, len(all_live_sessions(name))) for name in ACCOUNTS]
-    acct = pick("account", rows, lambda r: f"{r[0]:<10} {r[1]} live session(s)")[0]
+    accounts = discover_accounts()
+    if not accounts:
+        sys.exit("no logged-in accounts found")
+    rows = [(a, provider_of(a).live_sessions(a)) for a in accounts]
+    acct, live = pick("account", rows,
+                      lambda r: f"{r[0]['label']:<10} {r[0]['provider']:<7} "
+                                f"{len(r[1])} live session(s)")
+    label = acct["label"]
+    prov = provider_of(acct)
 
-    live = all_live_sessions(acct)
     if not live:
-        sys.exit(f"no live sessions on {acct!r} — open the session in a "
+        sys.exit(f"no live sessions on {label!r} — open the session in a "
                  f"terminal first (this tool messages running sessions).")
-    sess = pick(f"live sessions on {acct}", live,
+    sess = pick(f"live sessions on {label}", live,
                 lambda s: f"{s['name']:<26} {s['cwd']}")
 
     def vpath(v):
@@ -453,7 +398,7 @@ def cmd_wizard(_a=None):
         if ask("continue anyway? (y/n)", "n").lower() not in ("y", "yes"):
             return cmd_wizard()
 
-    detected, info = session_reset_at(acct)
+    detected, info = prov.session_reset_at(acct)
     if detected and detected > datetime.now():
         print(f"\n  detected reset: {detected:%a %d %H:%M} ({info})")
         reset = ask("reset (Enter = detected)",
@@ -472,9 +417,14 @@ def cmd_wizard(_a=None):
                     "5", vdelay))
     fu = ask("follow-up (+5h5m / 10:50am / off)", "+5h5m",
              lambda v: parse_followup(v, datetime.now()))
-    msg = ask("continue message", DEFAULT_CONTINUE[:44] + "…")
-    if msg == DEFAULT_CONTINUE[:44] + "…":
-        msg = DEFAULT_CONTINUE
+
+    query = ask("extra query (Enter = none)", "", allow_empty=True).strip()
+    msg = None                      # None => default continue text (+ query)
+    if not query:
+        shown = DEFAULT_CONTINUE[:44] + "…"
+        typed = ask("continue message", shown)
+        if typed != shown:
+            msg = typed             # full verbatim override
     fmsg = ask("follow-up message", DEFAULT_FOLLOWUP[:44] + "…") \
         if fu.lower() not in ("off", "none", "no") else DEFAULT_FOLLOWUP
     if fmsg == DEFAULT_FOLLOWUP[:44] + "…":
@@ -483,44 +433,74 @@ def cmd_wizard(_a=None):
 
     print(f"""
 ── summary ──
-  account   : {acct}
+  account   : {label} ({acct['provider']})
   session   : {sess['name']}
   path      : {path}
   reset     : {reset}   continue: reset + {delay}m   follow-up: {fu}
+  message   : {continue_message(query or None, msg)}
   ttl       : {ttl}h""")
     if ask("schedule? (y/n)", "y").lower() not in ("y", "yes"):
         print("aborted")
         return
     import types
     cmd_add(types.SimpleNamespace(
-        account=acct, session=sess["name"], path=path, reset=reset,
-        delay=delay, follow_up=fu, message=msg, follow_up_message=fmsg, ttl=ttl))
+        account=label, session=sess["name"], path=path, reset=reset,
+        delay=delay, follow_up=fu, query=query or None, message=msg,
+        follow_up_message=fmsg, ttl=ttl))
 
 
 # ----------------------------------------------------------------- commands ---
+def schedule_account_anchor(acct, at, message=None, ttl_hours=12, spawn=True):
+    """Register a throwaway anchor ping for a whole ACCOUNT at `at`.
+
+    Used by `agentctl anchor` for an account that was mid-window when the
+    morning job ran: the ping it sent could not open a window (a 5-hour window
+    is fixed from its first request), so one is queued for the moment the
+    current window actually expires. Replaces any pending anchor for the same
+    account. -> True when it was (re)scheduled."""
+    label = acct["label"]
+    entries = [e for e in load_registry()
+               if not (e.get("kind") == "account-anchor" and e["account"] == label)]
+    entries.append({
+        "provider": acct["provider"], "kind": "account-anchor",
+        "account": label, "session": None, "path": None,
+        "reset_at": at.isoformat(timespec="seconds"),
+        "actions": [{"kind": "anchor", "at": at.isoformat(timespec="seconds"),
+                     "message": message or DEFAULT_FOLLOWUP,
+                     "retries": 0, "done": False}],
+        "expires_at": (at + timedelta(hours=ttl_hours)).isoformat(timespec="seconds"),
+    })
+    save_registry(entries)
+    log(f"scheduled anchor for {label} @ {at:%a %H:%M} "
+        f"(account was mid-window; ping could not open a new one)")
+    if spawn:
+        ensure_daemon()          # callers scheduling several in a row pass
+                                 # spawn=False and call ensure_daemon() once
+    return True
+
+
 def cmd_add(a):
-    if a.account not in ACCOUNTS:
-        sys.exit(f"unknown account {a.account!r} — one of: {', '.join(ACCOUNTS)}")
+    acct = resolve_account(a.account)
+    label, prov = acct["label"], provider_of(acct)
     path = norm_path(a.path)
 
-    live = find_live_sessions(a.account, a.session, path)
+    live = prov.find_live_sessions(acct, a.session, path)
     if not live:
         where = f" with cwd {path}" if path else ""
-        others = find_live_sessions(a.account, a.session) if path else []
+        others = prov.find_live_sessions(acct, a.session) if path else []
         hint = (f" (a live {a.session!r} exists at {others[0].get('cwd')})"
                 if others else "")
-        sys.exit(f"no LIVE session named {a.session!r}{where} on {a.account!r}{hint}"
+        sys.exit(f"no LIVE session named {a.session!r}{where} on {label!r}{hint}"
                  f" — keep the session's terminal open, then re-run.")
     if not path:
         path = norm_path(live[0].get("cwd"))
 
     if a.reset == "auto":
-        reset_at, info = session_reset_at(a.account)
+        reset_at, info = prov.session_reset_at(acct)
         if not reset_at:
             sys.exit(f"couldn't auto-detect reset time ({info}) — pass "
                      f"--reset HH:MMam explicitly.")
-        log(f"detected session reset for {a.account}: "
-            f"{reset_at:%a %H:%M} ({info})")
+        log(f"detected session reset for {label}: {reset_at:%a %H:%M} ({info})")
         if reset_at <= datetime.now():
             sys.exit(f"detected reset {reset_at:%H:%M} is already past — the "
                      f"account is usable now; just continue the session yourself.")
@@ -536,19 +516,22 @@ def cmd_add(a):
     except ValueError as e:
         sys.exit(f"✗ {e}")
 
+    message = continue_message(getattr(a, "query", None), a.message)
     actions = [{"kind": "continue", "at": continue_at.isoformat(timespec="seconds"),
-                "message": a.message, "retries": 0, "done": False}]
+                "message": message, "retries": 0, "done": False}]
     if followup_at:
         actions.append({"kind": "follow-up",
                         "at": followup_at.isoformat(timespec="seconds"),
                         "message": a.follow_up_message, "retries": 0, "done": False})
 
     entries = [e for e in load_registry()
-               if not (e["account"] == a.account and e["session"] == a.session
+               if not (e["account"] == label and e["session"] == a.session
                        and e.get("path") == path)]
     entries.append({
-        "account": a.account, "session": a.session, "path": path,
+        "provider": acct["provider"],
+        "account": label, "session": a.session, "path": path,
         "reset_at": reset_at.isoformat(timespec="seconds"),
+        "delay": a.delay,
         "actions": actions,
         "expires_at": (datetime.now() + timedelta(hours=a.ttl)
                        ).isoformat(timespec="seconds"),
@@ -557,20 +540,21 @@ def cmd_add(a):
     plan = f"continue @ {continue_at:%a %H:%M}"
     if followup_at:
         plan += f", follow-up @ {followup_at:%a %H:%M}"
-    log(f"added {a.account}/{a.session} ({path}): {plan} (expires in {a.ttl}h)")
+    log(f"added {label}/{a.session} ({path}): {plan} (expires in {a.ttl}h)")
     ensure_daemon()
 
 
 def cmd_detect(a):
-    dt, info = session_reset_at(a.account)
+    acct = resolve_account(a.account)
+    dt, info = provider_of(acct).session_reset_at(acct)
     if a.json:
-        print(json.dumps({"account": a.account,
+        print(json.dumps({"account": acct["label"], "provider": acct["provider"],
                           "reset_at": dt.strftime("%Y-%m-%dT%H:%M") if dt else None,
                           "info": info}))
     elif dt:
-        print(f"{a.account}: session resets {dt:%a %d %b %H:%M} ({info})")
+        print(f"{acct['label']}: session resets {dt:%a %d %b %H:%M} ({info})")
     else:
-        print(f"{a.account}: {info}")
+        print(f"{acct['label']}: {info}")
 
 
 def cmd_list(_a):
@@ -582,16 +566,19 @@ def cmd_list(_a):
             f"{x['kind']} @ {x['at'][:16].replace('T', ' ')}"
             + (" ✓" if x["done"] else (f" (retry {x['retries']})" if x["retries"] else ""))
             for x in e["actions"])
-        print(f"{e['account']}/{e['session']}  [{e.get('path', '?')}]\n"
-              f"  reset {e['reset_at'][:16].replace('T', ' ')} — {acts}")
+        title = (f"{e['account']}  (account anchor)" if e.get("kind") == "account-anchor"
+                 else f"{e['account']}/{e['session']}  [{e.get('path', '?')}]")
+        print(f"{title}\n"
+              f"  {e.get('provider', '?')} — reset "
+              f"{e['reset_at'][:16].replace('T', ' ')} — {acts}")
     try:
         pid = int(open(PIDFILE).read().strip())
         os.kill(pid, 0)
         print(f"daemon: running (pid {pid})")
     except Exception:
         if entries and any(not x["done"] for e in entries for x in e["actions"]):
-            print("daemon: NOT running — run any `claude-renew add` or "
-                  "`claude-renew start` to revive it")
+            print("daemon: NOT running — run any `agentctl renew add` or "
+                  "`agentctl renew start` to revive it")
         else:
             print("daemon: not running (nothing pending)")
 
@@ -626,22 +613,26 @@ def cmd_log(a):
         subprocess.run(["tail", "-30", LOG])
 
 
-def main():
-    if len(sys.argv) == 1 and sys.stdin.isatty():
-        return cmd_wizard()   # bare `claude-renew` -> interactive, validated setup
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    migrate_legacy()
+    if not argv and sys.stdin.isatty():
+        cmd_wizard()      # bare `agentctl renew` -> interactive, validated setup
+        return 0
     ap = argparse.ArgumentParser(
-        prog="claude-renew",
-        description="Resume interrupted sessions the moment their limit renews. "
-                    "Run with no arguments for the interactive setup wizard.")
+        prog="agentctl renew",
+        description="Resume interrupted sessions the moment their limit renews "
+                    "(Claude Code and Codex). Run with no arguments for the "
+                    "interactive setup wizard.")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("add", help="register a session to auto-continue at reset")
-    p.add_argument("account", choices=list(ACCOUNTS), help="account alias")
+    p.add_argument("account", help="account label (agentctl accounts)")
     p.add_argument("session", help="session name (its /rename alias)")
     p.add_argument("--path", help="project path the session must live in "
                                   "(default: taken from the live session)")
     p.add_argument("--reset", default="auto",
-                   help="'auto' (query the usage API, default) or HH:MMam")
+                   help="'auto' (ask the provider, default) or HH:MMam")
     p.add_argument("--delay", type=int, default=5, metavar="MIN",
                    choices=DELAY_CHOICES,
                    help="minutes after reset to send the continue "
@@ -649,8 +640,12 @@ def main():
     p.add_argument("--follow-up", default="+5h5m", metavar="WHEN",
                    help="anchor message: '+5h5m' after continue (default), "
                         "a clock time like 10:50am, or 'off'")
-    p.add_argument("--message", default=DEFAULT_CONTINUE,
-                   help="custom continue message")
+    p.add_argument("--query", metavar="TEXT",
+                   help="extra instruction appended to the default continue "
+                        'message, e.g. --query "Continue, and consider ..."')
+    p.add_argument("--message",
+                   help="full verbatim continue message (replaces the default "
+                        "and --query)")
     p.add_argument("--follow-up-message", default=DEFAULT_FOLLOWUP,
                    help="custom follow-up message")
     p.add_argument("--ttl", type=int, default=24, metavar="HOURS",
@@ -661,7 +656,7 @@ def main():
     p.set_defaults(fn=cmd_wizard)
 
     p = sub.add_parser("detect", help="print an account's session reset time")
-    p.add_argument("account", choices=list(ACCOUNTS))
+    p.add_argument("account", help="account label")
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_detect)
 
@@ -683,9 +678,10 @@ def main():
     p = sub.add_parser("run-daemon", help=argparse.SUPPRESS)
     p.set_defaults(fn=cmd_run_daemon)
 
-    a = ap.parse_args()
-    a.fn(a)
+    a = ap.parse_args(argv)
+    rc = a.fn(a)
+    return 0 if rc is None else rc
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -56,7 +56,7 @@ Everything below is keyed by session id, and all of it is needed for a clean res
 | # | Item | Path (relative to the config dir) |
 |---|---|---|
 | 1 | Transcript | `projects/<project-key>/<sid>.jsonl` |
-| 2 | Session sidecar — subagent transcripts, `workflows/scripts/*.js`, workflow journals, tool-results | `projects/<project-key>/<sid>/` |
+| 2 | Session sidecar — subagent transcripts, `workflows/scripts/*.js`, workflow journals, tool-results | `projects/<project-key>/<sid>/` — plus any `projects/<other-key>/<sid>/` (a session that worked from a subdirectory can write sidecars, e.g. a Workflow's `scriptPath`, under that subdir's key; each is copied under the same key) |
 | 3 | Project memory (`MEMORY.md` + memory files), merged additively | `projects/<project-key>/memory/` |
 | 4 | Task list | `tasks/<sid>/` |
 | 5 | File-history versions (used by rewind / undo) | `file-history/<sid>/` |

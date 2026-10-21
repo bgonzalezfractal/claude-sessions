@@ -1,6 +1,6 @@
 # Claude Session Restarter — Reference (LEGACY)
 
-> **Superseded 2026-09-07 by [`claude-renew`](claude-renew.md)** — same mechanism,
+> **Superseded 2026-09-07 by [`agentctl renew`](renew.md)** — same mechanism,
 > plus exact reset detection via the usage API, `--path` pinning, personalizable
 > timings/messages, and proper remove/list/log commands. The prototype below
 > (`~/.claude/session-restarter.py`) still works but is no longer maintained.
@@ -30,7 +30,7 @@ back-to-back usage with no dead time.
   its own terminal, on its own model and permission mode. Peer visibility is per
   config dir, hence the per-account helper.
 - The **default account helper runs without `CLAUDE_CONFIG_DIR`** (keychain gotcha —
-  see `claude-limit-reset-cron.md`).
+  see [anchor.md](anchor.md)).
 - If the account is **still limited** at fire time, the helper fails with the limit
   message; the daemon retries every 10 min (max 8 tries). Same if the session isn't
   found live.
@@ -68,7 +68,7 @@ tail ~/.claude/session-restarter/restarter.log
 The daemon auto-spawns on `register` and exits on its own. It survives closing the
 registering terminal, but **not** a reboot; if the Mac sleeps past a fire time, it
 fires on the next wake (keep the Mac asleep, not shut down — and `pmset` can schedule
-a wake, see the limit-reset doc).
+a wake, see [anchor.md](anchor.md)).
 
 ## Testing it later (fast-forward trick, used for the 2026-09-06 validation)
 

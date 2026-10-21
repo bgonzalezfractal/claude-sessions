@@ -1,37 +1,40 @@
-#!/usr/bin/env python3
 """
-claude-sessions-ui — localhost dashboard for the claude-sessions toolkit.
+agentctl ui — localhost dashboard for agentctl.
 
-    claude-sessions-ui [--port 8788] [--no-open]
+    agentctl ui [--port 8788] [--no-open]
 
 A small app with a menu and one view per feature:
   Home      — at-a-glance: session bar + next reset per account, queue, daemon
-  Usage     — full limit bars (session / weekly / weekly-Fable)
+  Usage     — full limit bars (session / weekly / weekly-scoped)
   Sessions  — live sessions, one-click renew
   Renew     — schedule auto-continues: datetime picker fed by detection,
-              delay 0-30 in steps of 5, path pinning; queue with cancel
+              delay 0-30 in steps of 5, path pinning, optional extra query;
+              queue with cancel
   Copy      — migrate sessions between accounts; origin + destination paths
-  Accounts  — alias list + scaffolding
+  Accounts  — account list (every provider) + scaffolding
   Activity  — SQLite-backed audit log
 
-Python stdlib only. Binds 127.0.0.1. All real work is delegated to the sibling
-CLIs so behavior lives in one place; actions are logged to
-~/.claude/claude-sessions-ui.db (table `events`).
+Python stdlib only. Binds 127.0.0.1. All real work is delegated to `agentctl
+<command>` so behavior lives in one place; actions are logged to
+~/.agentctl/ui.db (table `events`).
 """
-
 import argparse, json, os, sqlite3, subprocess, sys, urllib.parse, webbrowser
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import agentctl
+
 HOME = os.path.expanduser("~")
-BIN = os.path.dirname(os.path.realpath(__file__))
-DB = os.path.join(HOME, ".claude", "claude-sessions-ui.db")
-RENEW_REGISTRY = os.path.join(HOME, ".claude", "claude-renew", "registry.json")
-RENEW_PID = os.path.join(HOME, ".claude", "claude-renew", "daemon.pid")
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+AGENTCTL = os.path.join(REPO_ROOT, "bin", "agentctl")
+DB = agentctl.UI_DB
+RENEW_REGISTRY = agentctl.RENEW_REGISTRY
+RENEW_PID = agentctl.RENEW_PIDFILE
 
 
 # ------------------------------------------------------------------ storage ---
 def db():
+    os.makedirs(os.path.dirname(DB), exist_ok=True)
     c = sqlite3.connect(DB)
     c.execute("""CREATE TABLE IF NOT EXISTS events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,14 +58,15 @@ def recent_events(n=60):
 
 
 # ---------------------------------------------------------------- cli bridge ---
-def run_cli(tool, *args, timeout=90):
-    r = subprocess.run([os.path.join(BIN, tool), *args],
+def run_cli(sub, *args, timeout=90):
+    """`agentctl <sub> ...` — the CLI is the single source of behavior."""
+    r = subprocess.run([sys.executable, AGENTCTL, sub, *args],
                        capture_output=True, text=True, timeout=timeout)
     return r.returncode == 0, (r.stdout or "") + (r.stderr or "")
 
 
-def cli_json(tool, *args, timeout=90):
-    ok, out = run_cli(tool, *args, timeout=timeout)
+def cli_json(sub, *args, timeout=90):
+    ok, out = run_cli(sub, *args, timeout=timeout)
     if not ok:
         return None
     try:
@@ -72,16 +76,16 @@ def cli_json(tool, *args, timeout=90):
 
 
 def overview(with_usage=False):
-    accounts = cli_json("claude-account", "list", "--json") or []
-    # The usage endpoint rate-limits frequent checks (429) — it is only called
+    accounts = cli_json("accounts", "list", "--json") or []
+    # The usage endpoints rate-limit frequent checks (429) — they are only called
     # when the user explicitly asks (?usage=1), never on an automatic refresh.
-    usage = (cli_json("claude-status", "--json", timeout=120) or {}) \
+    usage = (cli_json("status", "--json", timeout=120) or {}) \
         if with_usage else None
     sessions = {}
     for a in accounts:
         if a.get("logged_in"):
-            sessions[a["alias"]] = (cli_json("claude-copy-session", "--list",
-                                             a["alias"], "--json") or [])
+            sessions[a["alias"]] = (cli_json("copy", "--list", a["alias"],
+                                             "--json") or [])
     try:
         renew = json.load(open(RENEW_REGISTRY))
     except Exception:
@@ -94,26 +98,30 @@ def overview(with_usage=False):
         pass
     return {"accounts": accounts, "usage": usage, "sessions": sessions,
             "renew": renew, "renew_daemon": daemon, "events": recent_events(),
-            "log": cli_json("claude-log", "--json", "-n", "60") or [],
+            "log": cli_json("log", "--json", "-n", "60") or [],
             "now": datetime.now().strftime("%a %d %b · %H:%M:%S")}
 
 
 ACTIONS = {
     "renew_add": lambda p: run_cli(
-        "claude-renew", "add", p["account"], p["session"],
+        "renew", "add", p["account"], p["session"],
         *(["--path", p["path"]] if p.get("path") else []),
         *(["--reset", p["reset"]] if p.get("reset") else []),
         *(["--delay", str(p["delay"])] if p.get("delay") not in (None, "") else []),
-        *(["--follow-up", p["follow_up"]] if p.get("follow_up") else [])),
+        *(["--follow-up", p["follow_up"]] if p.get("follow_up") else []),
+        *(["--query", p["query"]] if (p.get("query") or "").strip() else []),
+        *(["--message", p["message"]] if (p.get("message") or "").strip() else [])),
     "renew_remove": lambda p: run_cli(
-        "claude-renew", "remove", p["session"],
+        "renew", "remove", p["session"],
         *(["--account", p["account"]] if p.get("account") else [])),
     "copy": lambda p: run_cli(
-        "claude-copy-session", p["src"], p["dst"], p["session"],
+        "copy", p["src"], p["dst"], p["session"],
         *(["--path", p["src_path"]] if p.get("src_path") else []),
         *(["--to-path", p["dst_path"]] if p.get("dst_path") else []),
         *(["--dry-run"] if p.get("dry_run") else []), timeout=300),
-    "account_add": lambda p: run_cli("claude-account", "add", p["alias"]),
+    "account_add": lambda p: run_cli(
+        "accounts", "add", p["alias"],
+        *(["--provider", p["provider"]] if p.get("provider") else [])),
 }
 
 
@@ -139,7 +147,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, overview(q.get("usage", ["0"])[0] == "1"))
         elif url.path == "/api/reset":
             acct = urllib.parse.parse_qs(url.query).get("account", [""])[0]
-            self._send(200, cli_json("claude-renew", "detect", acct, "--json")
+            self._send(200, cli_json("renew", "detect", acct, "--json")
                        or {"reset_at": None, "info": "detect failed"})
         else:
             self._send(404, {"error": "not found"})
@@ -150,6 +158,7 @@ class Handler(BaseHTTPRequestHandler):
         if not fn:
             self._send(404, {"error": "unknown action"})
             return
+        payload = {}
         try:
             n = int(self.headers.get("Content-Length") or 0)
             payload = json.loads(self.rfile.read(n) or b"{}")
@@ -162,7 +171,7 @@ class Handler(BaseHTTPRequestHandler):
 
 PAGE = r"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>claude-sessions</title>
+<title>agentctl</title>
 <style>
 :root{--bg:#0a0a0a;--panel:#111;--line:#232323;--fg:#e8e8e8;--dim:#8a8a8a;
       --pink:#E5188E;--grn:#3ddc84;--yel:#ffc107;--red:#ff4d4d;--cyn:#4dd0e1}
@@ -185,6 +194,8 @@ h1{font-size:14px;letter-spacing:.12em;text-transform:uppercase;margin-bottom:4p
   border-bottom:1px solid var(--line);padding-bottom:8px;margin-bottom:12px}
 .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px}
 .aname{color:var(--pink);font-weight:700}
+.prov{color:var(--dim);font-size:10px;letter-spacing:.1em;text-transform:uppercase;
+  border:1px solid var(--line);padding:1px 6px;margin-left:6px;border-radius:2px}
 .muted{color:var(--dim)}.small{font-size:11px}
 .lim{display:flex;align-items:center;gap:8px;margin:3px 0}
 .lim .lab{width:100px;color:var(--dim);font-size:11px;flex:none}
@@ -198,8 +209,9 @@ button{background:transparent;border:1px solid var(--pink);color:var(--pink);
 button:hover{background:var(--pink);color:#000}
 button.dim{border-color:var(--line);color:var(--dim)}
 button.dim:hover{background:#1c1c1c;color:var(--fg)}
-select,input{background:#0e0e0e;border:1px solid var(--line);color:var(--fg);
+select,input,textarea{background:#0e0e0e;border:1px solid var(--line);color:var(--fg);
   font:inherit;padding:6px 8px;width:100%;color-scheme:dark}
+textarea{resize:vertical;min-height:52px}
 label{color:var(--dim);font-size:11px;display:block;margin:10px 0 3px}
 .row{display:flex;gap:12px;flex-wrap:wrap}.row>div{flex:1;min-width:150px}
 .list-item{display:flex;justify-content:space-between;align-items:center;gap:10px;
@@ -229,7 +241,7 @@ th{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.1em}
   .lim .rst{display:none}
 }
 </style></head><body>
-<nav><div class="logo">claude-<b>sessions</b></div>
+<nav><div class="logo">agent<b>ctl</b></div>
   <a href="#home" data-v="home">Home</a>
   <a href="#usage" data-v="usage">Usage</a>
   <a href="#sessions" data-v="sessions">Sessions</a>
@@ -249,8 +261,8 @@ th{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.1em}
 </div>
 
 <div class="view" id="v-usage">
-  <h1>Usage</h1><div class="sub">session · weekly · weekly-Fable — read-only.
-  Fetched only when you ask: the endpoint rate-limits frequent checks.
+  <h1>Usage</h1><div class="sub">session · weekly · weekly-scoped — read-only.
+  Fetched only when you ask: the endpoints rate-limit frequent checks.
   <button class="dim refresh-btn" onclick="refresh(true)">↻ refresh usage</button></div>
   <div id="u-accounts"></div>
 </div>
@@ -283,13 +295,15 @@ th{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.1em}
         <option value="off">off</option><option value="custom">at a time…</option></select>
       <input type="time" id="r_fu_time" style="display:none;margin-top:6px"></div>
     </div>
+    <label>extra query — appended to the continue message (optional)</label>
+    <textarea id="r_query" placeholder="e.g. start with the failing test in src/api/"></textarea>
     <button style="margin-top:14px" onclick="renewAdd()">schedule renew</button>
   </div>
   <div class="card"><h2>Queue <span id="r-daemon"></span></h2><div id="r-queue"></div></div>
 </div>
 
 <div class="view" id="v-copy">
-  <h1>Copy session</h1><div class="sub">fork a session to another account — same or a different path. Exit the source session after copying.</div>
+  <h1>Copy session</h1><div class="sub">fork a session to another account — same or a different path. Exit the source session after copying. Claude accounts only.</div>
   <div class="card">
     <div class="row">
       <div><label>from account</label><select id="c_src"></select></div>
@@ -306,18 +320,23 @@ th{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.1em}
 </div>
 
 <div class="view" id="v-accounts">
-  <h1>Accounts</h1><div class="sub">aliases on this Mac — new ones auto-join every tool after first login</div>
+  <h1>Accounts</h1><div class="sub">every provider's accounts on this Mac — new ones auto-join every command after first login</div>
   <div class="card"><table id="a-table"></table></div>
   <div class="card"><h2>New account</h2>
-    <label>alias (a-z 0-9 -)</label><input id="a_name" placeholder="e.g. work">
+    <div class="row">
+      <div><label>alias (a-z 0-9 -)</label><input id="a_name" placeholder="e.g. work"></div>
+      <div><label>provider</label><select id="a_prov">
+        <option value="claude">claude</option><option value="codex">codex</option>
+      </select></div>
+    </div>
     <button style="margin-top:12px" onclick="acctAdd()">scaffold account</button>
-    <p class="muted small" style="margin-top:10px">Creates ~/.claude-&lt;alias&gt; + the
-    shell alias. Then run it in a terminal and /login.</p></div>
+    <p class="muted small" style="margin-top:10px">Creates ~/.&lt;provider&gt;-&lt;alias&gt; +
+    the shell alias. Then run it in a terminal and log in.</p></div>
 </div>
 
 <div class="view" id="v-activity">
-  <h1>Activity</h1><div class="sub">scheduler fires, morning pings, and UI actions</div>
-  <div class="card"><h2>Scheduler &amp; pings <span class="muted">· claude-log</span></h2>
+  <h1>Activity</h1><div class="sub">scheduler fires, morning anchor pings, and UI actions</div>
+  <div class="card"><h2>Scheduler &amp; pings <span class="muted">· agentctl log</span></h2>
     <div id="l-list"></div></div>
   <div class="card"><h2>UI actions <span class="muted">· sqlite</span></h2>
     <div id="e-list"></div></div>
@@ -342,13 +361,15 @@ function fmtReset(iso){if(!iso)return"";const d=new Date(iso),n=new Date();
   return"resets "+(d.toDateString()===n.toDateString()?"":d.toLocaleDateString([],{weekday:"short"})+" ")+t}
 function limLabel(l){if(l.kind==="session")return"session (5h)";
   if(l.kind==="weekly_all")return"weekly";
-  return"weekly "+(((l.scope||{}).model||{}).display_name||(l.kind==="weekly_scoped"?"Fable":l.kind))}
+  return"weekly "+(((l.scope||{}).model||{}).display_name||(l.kind==="weekly_scoped"?"scoped":l.kind))}
 function limRow(l){return`<div class="lim"><span class="lab">${limLabel(l)}</span>
   <span class="bar"><i style="width:${Math.min(100,l.percent||0)}%;
   background:${barColor(l.percent||0,l.kind)}"></i></span>
   <span class="pct">${l.percent??"?"}%</span>
   <span class="rst">${l.resets_at?fmtReset(l.resets_at):esc(l.reset_text||"")}</span></div>`}
 function sessOf(l){return(l||[]).find(x=>x.kind==="session")||{}}
+function provTag(a){return a.provider?`<span class="prov">${esc(a.provider)}</span>`:""}
+function planLine(u){return u.plan?`<div class="muted small">plan: ${esc(u.plan)}</div>`:""}
 
 let USAGE={},USAGE_AT=null;
 async function refresh(withUsage=false){
@@ -370,7 +391,7 @@ async function refresh(withUsage=false){
       ${O.renew_daemon?"on":"off"}</b><span>renew daemon</span></span>`;
   $("h-accounts").innerHTML=O.accounts.map(a=>{
     const u=O.usage[a.alias]||{},s=sessOf(u.limits);
-    return`<div class="card"><span class="aname">${esc(a.alias)}</span>
+    return`<div class="card"><span class="aname">${esc(a.alias)}</span>${provTag(a)}
       <span class="muted small"> ${a.logged_in?esc(a.email):"not logged in"}
       · ${a.live_sessions} live</span>
       ${u.limits?limRow(s):`<div class="muted small">${esc(u.error?"✗ "+u.error:"usage not fetched — ↻ refresh")}</div>`}
@@ -382,29 +403,35 @@ async function refresh(withUsage=false){
       ${esc(e.account)}/${esc(e.session)}</span>
       <span class="muted small"> ${tilde(e.path)} · ${acts}</span></span>
       <button class="dim" onclick="renewRemove('${esc(e.session)}','${esc(e.account)}')">cancel</button>
-      </div>`}).join("")||'<span class="muted">queue empty — register only interrupted work; the morning job anchors fresh days</span>';
+      </div>`}).join("")||'<span class="muted">queue empty — register only interrupted work; the morning anchor job anchors fresh days</span>';
   $("h-queue").innerHTML=queue;$("r-queue").innerHTML=queue;
   const dtxt=O.renew_daemon?"· daemon ✓":"· daemon off";
   $("h-daemon").textContent=dtxt;$("r-daemon").textContent=dtxt;
   $("u-accounts").innerHTML=O.accounts.map(a=>{
     const u=O.usage[a.alias]||{};
-    return`<div class="card"><span class="aname">${esc(a.alias)}</span>
+    return`<div class="card"><span class="aname">${esc(a.alias)}</span>${provTag(a)}
       <span class="muted small"> ${a.logged_in?esc(a.email):"not logged in"}</span>
+      ${planLine(u)}
       ${(u.limits||[]).map(limRow).join("")||`<div class="muted small">${esc(u.error?"✗ "+u.error:"usage not fetched — ↻ refresh")}</div>`}
       </div>`}).join("");
+  const provOf={};O.accounts.forEach(a=>provOf[a.alias]=a.provider);
   $("s-list").innerHTML=Object.entries(O.sessions).map(([acct,list])=>
     list.filter(s=>s.live).map(s=>`<div class="list-item">
-      <span class="tt"><span class="live-dot">●</span> <b>${esc(s.title||"(untitled)")}</b>
-      <span class="muted small"> ${esc(acct)} · ${esc(tilde(s.cwd))}</span></span>
-      <button class="dim" onclick="quickRenew('${esc(acct)}','${esc(s.title)}','${esc(s.cwd||"")}')">renew</button>
+      <span class="tt"><span class="live-dot">●</span> <b>${esc(s.title||s.name||"(untitled)")}</b>
+      <span class="muted small"> ${esc(acct)} · ${esc(provOf[acct]||"")} · ${esc(tilde(s.cwd))}</span></span>
+      <button class="dim" onclick="quickRenew('${esc(acct)}','${esc(s.title||s.name||"")}','${esc(s.cwd||"")}')">renew</button>
       </div>`).join("")).join("")||'<span class="muted">no live sessions</span>';
   const opts=O.accounts.filter(a=>a.logged_in).map(a=>`<option>${esc(a.alias)}</option>`).join("");
-  for(const id of["r_acct","c_src","c_dst"]){const el=$(id),v=el.value;
-    el.innerHTML=opts;if(v)el.value=v}
+  const copyOpts=O.accounts.filter(a=>a.logged_in&&a.provider==="claude")
+    .map(a=>`<option>${esc(a.alias)}</option>`).join("");
+  for(const id of["r_acct"]){const el=$(id),v=el.value;el.innerHTML=opts;if(v)el.value=v}
+  for(const id of["c_src","c_dst"]){const el=$(id),v=el.value;
+    el.innerHTML=copyOpts;if(v)el.value=v}
   fillRenew();fillCopy();
-  $("a-table").innerHTML=`<tr><th>alias</th><th>shell alias</th><th>state</th>
-    <th>keychain</th><th>live</th></tr>`+O.accounts.map(a=>`<tr>
-    <td class="aname">${esc(a.alias)}</td><td>${esc(a.shell_alias||"—")}</td>
+  $("a-table").innerHTML=`<tr><th>account</th><th>provider</th><th>shell alias</th>
+    <th>state</th><th>credential</th><th>live</th></tr>`+O.accounts.map(a=>`<tr>
+    <td class="aname">${esc(a.alias)}</td><td class="muted">${esc(a.provider||"")}</td>
+    <td>${esc(a.shell_alias||"—")}</td>
     <td>${a.logged_in?"✓ "+esc(a.email):'<span style="color:var(--red)">not logged in</span>'}</td>
     <td>${a.keychain?"✓":"✗"}</td><td>${a.live_sessions}</td></tr>`).join("");
   const KC={"continue":"var(--cyn)","follow-up":"var(--pink)","reset-ping":"var(--grn)",
@@ -422,8 +449,8 @@ async function refresh(withUsage=false){
 }
 function fillRenew(){
   const rl=(O.sessions[$("r_acct").value]||[]).filter(s=>s.live),v=$("r_sess").value;
-  $("r_sess").innerHTML=rl.map(s=>`<option value="${esc(s.title)}"
-    data-cwd="${esc(s.cwd||"")}">${esc(s.title)}</option>`).join("");
+  $("r_sess").innerHTML=rl.map(s=>`<option value="${esc(s.title||s.name||"")}"
+    data-cwd="${esc(s.cwd||"")}">${esc(s.title||s.name||"(untitled)")}</option>`).join("");
   if(v)$("r_sess").value=v;
   const o=$("r_sess").selectedOptions[0];
   $("r_path").value=o?o.dataset.cwd||"":"";
@@ -464,34 +491,38 @@ function renewAdd(){
   if(!$("r_reset").value){toast("✗ pick a reset time (or detect it)");return}
   post("renew_add",{account:$("r_acct").value,session:$("r_sess").value,
     path:$("r_path").value||null,reset:$("r_reset").value,
-    delay:$("r_delay").value,follow_up:fuValue()})}
+    delay:$("r_delay").value,follow_up:fuValue(),
+    query:$("r_query").value||null})}
 function quickRenew(acct,sess,cwd){post("renew_add",{account:acct,session:sess,path:cwd||null})}
 function renewRemove(s,a){post("renew_remove",{session:s,account:a})}
 function copySess(dry){post("copy",{src:$("c_src").value,dst:$("c_dst").value,
   session:$("c_sess").value,src_path:$("c_src_path").value||null,
   dst_path:$("c_dst_path").value||null,dry_run:dry})}
-function acctAdd(){const n=$("a_name").value.trim();if(n)post("account_add",{alias:n})}
+function acctAdd(){const n=$("a_name").value.trim();
+  if(n)post("account_add",{alias:n,provider:$("a_prov").value})}
 // Manual refresh only — no polling. Opening the page loads the cheap local
 // state (accounts, sessions, queue, events); usage is fetched on demand.
 nav();refresh(false);
 </script></body></html>"""
 
 
-def main():
-    ap = argparse.ArgumentParser(prog="claude-sessions-ui")
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="agentctl ui",
+                                 description="Localhost dashboard for agentctl.")
     ap.add_argument("--port", type=int, default=8788)
     ap.add_argument("--no-open", action="store_true")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     srv = ThreadingHTTPServer(("127.0.0.1", a.port), Handler)
     url = f"http://127.0.0.1:{a.port}"
-    print(f"claude-sessions-ui on {url}  (Ctrl-C to stop; events -> {DB})")
+    print(f"agentctl ui on {url}  (Ctrl-C to stop; events -> {DB})")
     if not a.no_open:
         webbrowser.open(url)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\nbye")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
