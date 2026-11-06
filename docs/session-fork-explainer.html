@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Why a copied session is a branch that shares one working directory</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --card: #ffffff; --ink: #1d1d1f; --muted: #6b6b70; --line: #dcdcd8;
+    --old: #c77700; --old-bg: #fff4e0; --new: #1f5fbf; --new-bg: #e6efff;
+    --shared: #55575c; --shared-bg: #eeeeec; --bad: #c0392b; --bad-bg: #fdecea; --ok: #1e8449; --ok-bg: #e8f6ee;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161618; --card: #1f1f22; --ink: #ececef; --muted: #9a9aa2; --line: #34343a;
+      --old: #f0a63a; --old-bg: #3a2b12; --new: #6fa3ff; --new-bg: #16264a;
+      --shared: #b4b6bc; --shared-bg: #2a2a2e; --bad: #ff7a6b; --bad-bg: #3d1c19; --ok: #5fd08f; --ok-bg: #143223;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 980px; margin: 0 auto; padding: 40px 24px 80px; }
+  h1 { font-size: 28px; margin: 0 0 6px; }
+  h2 { font-size: 21px; margin: 48px 0 10px; }
+  h3 { font-size: 17px; margin: 0 0 8px; }
+  p.lead { color: var(--muted); margin: 0 0 28px; font-size: 17px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 20px 22px; }
+  .tag { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 13px; font-weight: 600; }
+  .t-old { background: var(--old-bg); color: var(--old); }
+  .t-new { background: var(--new-bg); color: var(--new); }
+  .t-shared { background: var(--shared-bg); color: var(--shared); }
+  .t-bad { background: var(--bad-bg); color: var(--bad); }
+  .t-ok { background: var(--ok-bg); color: var(--ok); }
+  svg text { fill: var(--ink); font-family: inherit; }
+  svg .muted { fill: var(--muted); }
+  .compare { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .compare .card h3 { display: flex; gap: 8px; align-items: center; }
+  .mini { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px;
+          background: var(--shared-bg); border-radius: 8px; padding: 10px 12px; white-space: pre; overflow-x: auto; }
+  /* scenario swimlanes */
+  .scenario { margin-top: 18px; }
+  .scenario .head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; }
+  .scenario .head .n { font-weight: 700; color: var(--bad); font-size: 18px; }
+  .lanes { display: grid; grid-template-columns: 56px 1fr 1fr 1fr; gap: 6px 10px; align-items: stretch; }
+  .lanes .hdr { font-size: 13px; font-weight: 700; text-align: center; padding: 6px; border-radius: 8px; }
+  .lanes .time { font-size: 12px; color: var(--muted); text-align: right; padding-top: 8px; }
+  .ev { border-radius: 8px; padding: 8px 10px; font-size: 14px; border: 1px solid transparent; }
+  .ev.old { background: var(--old-bg); border-color: var(--old); }
+  .ev.new { background: var(--new-bg); border-color: var(--new); }
+  .ev.shared { background: var(--shared-bg); border-color: var(--line); }
+  .ev.bad { background: var(--bad-bg); border-color: var(--bad); color: var(--bad); font-weight: 600; }
+  .ev.empty { background: transparent; }
+  .ev code { font-size: 12.5px; }
+  .outcome { margin-top: 10px; padding: 10px 14px; border-left: 4px solid var(--bad); background: var(--bad-bg); border-radius: 0 8px 8px 0; font-size: 15px; }
+  table { width: 100%; border-collapse: collapse; font-size: 15px; }
+  th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-size: 13px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .03em; }
+  .rules { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  .rule { background: var(--ok-bg); border: 1px solid var(--ok); border-radius: 10px; padding: 14px; }
+  .rule b { color: var(--ok); display: block; margin-bottom: 4px; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.92em; }
+  @media (max-width: 760px) { .compare, .rules { grid-template-columns: 1fr; } .lanes { grid-template-columns: 40px 1fr 1fr 1fr; font-size: 13px; } }
+</style>
+</head>
+<body>
+<main>
+
+<h1>Two sessions from one copy: forked conversations, one live set of files</h1>
+<p class="lead">Copying a session forks the <b>conversation</b>. It doesn't fork the files. Both sessions work on the
+<b>same git branch in the same checkout</b>, so each one sees the other's edits the next time it reads a file.
+What goes stale is each session's <b>memory</b> of a file, plus the things that aren't files at all.</p>
+
+<!-- ============ 1. The picture ============ -->
+<h2>1 · What forks and what stays one</h2>
+<div class="card">
+<svg viewBox="0 0 900 430" width="100%" role="img" aria-label="Two session conversations forked from one copy point, both working on one live set of files and shared resources">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8a8a90"/>
+    </marker>
+  </defs>
+
+  <line x1="30" y1="120" x2="190" y2="120" stroke="#8a8a90" stroke-width="4"/>
+  <circle cx="40" cy="120" r="8" fill="#8a8a90"/><circle cx="90" cy="120" r="8" fill="#8a8a90"/><circle cx="140" cy="120" r="8" fill="#8a8a90"/>
+  <text x="30" y="96" font-size="13" class="muted">Oct 19–26 · one session</text>
+
+  <circle cx="200" cy="120" r="14" fill="none" stroke="#8a8a90" stroke-width="4"/>
+  <text x="200" y="160" font-size="13" text-anchor="middle" font-weight="700">copy point</text>
+  <text x="200" y="176" font-size="12" text-anchor="middle" class="muted">Oct 26 · 14:19</text>
+
+  <path d="M214,114 C260,60 290,55 340,55 L860,55" fill="none" stroke-width="4" style="stroke:var(--old)"/>
+  <circle cx="420" cy="55" r="7" style="fill:var(--old)"/><circle cx="560" cy="55" r="7" style="fill:var(--old)"/><circle cx="700" cy="55" r="7" style="fill:var(--old)"/>
+  <rect x="730" y="42" width="160" height="26" rx="13" style="fill:var(--old-bg);stroke:var(--old)"/>
+  <text x="810" y="60" font-size="13" text-anchor="middle" font-weight="700" style="fill:var(--old)">OLD · benjr · Q&amp;A + HTML</text>
+
+  <path d="M214,126 C260,180 290,185 340,185 L860,185" fill="none" stroke-width="4" style="stroke:var(--new)"/>
+  <circle cx="400" cy="185" r="7" style="fill:var(--new)"/><circle cx="490" cy="185" r="7" style="fill:var(--new)"/><circle cx="580" cy="185" r="7" style="fill:var(--new)"/><circle cx="670" cy="185" r="7" style="fill:var(--new)"/>
+  <rect x="730" y="172" width="160" height="26" rx="13" style="fill:var(--new-bg);stroke:var(--new)"/>
+  <text x="810" y="190" font-size="13" text-anchor="middle" font-weight="700" style="fill:var(--new)">NEW · claude · code</text>
+
+  <line x1="420" y1="63" x2="210" y2="292" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#arr)" style="stroke:var(--old)"/>
+  <line x1="560" y1="63" x2="500" y2="292" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#arr)" style="stroke:var(--old)"/>
+  <line x1="700" y1="63" x2="740" y2="292" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#arr)" style="stroke:var(--old)"/>
+  <line x1="400" y1="193" x2="134" y2="292" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#arr)" style="stroke:var(--new)"/>
+  <line x1="490" y1="193" x2="344" y2="292" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#arr)" style="stroke:var(--new)"/>
+  <line x1="580" y1="193" x2="580" y2="292" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#arr)" style="stroke:var(--new)"/>
+  <line x1="670" y1="193" x2="790" y2="292" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#arr)" style="stroke:var(--new)"/>
+
+  <rect x="20" y="296" width="860" height="122" rx="12" stroke-width="1.5" style="fill:var(--shared-bg);stroke:var(--shared)"/>
+  <text x="36" y="320" font-size="14" font-weight="700" style="fill:var(--shared)">ONE of each — not forked</text>
+  <g font-size="13">
+    <rect x="36" y="332" width="196" height="72" rx="8" style="fill:var(--card);stroke:var(--line)"/>
+    <text x="48" y="354" font-weight="700">Repo files (live)</text>
+    <text x="48" y="373" class="muted">same branch, same checkout;</text>
+    <text x="48" y="390" class="muted">edits visible on next read</text>
+
+    <rect x="246" y="332" width="196" height="72" rx="8" style="fill:var(--card);stroke:var(--line)"/>
+    <text x="258" y="354" font-weight="700">Dev database</text>
+    <text x="258" y="373" class="muted">nirvana_dev, kept test</text>
+    <text x="258" y="390" class="muted">workspaces, Flotix locks</text>
+
+    <rect x="456" y="332" width="196" height="72" rx="8" style="fill:var(--card);stroke:var(--line)"/>
+    <text x="468" y="354" font-weight="700">Scratch folder</text>
+    <text x="468" y="373" class="muted">/private/tmp/…/cead6099/</text>
+    <text x="468" y="390" class="muted">same id → same folder</text>
+
+    <rect x="666" y="332" width="196" height="72" rx="8" style="fill:var(--card);stroke:var(--line)"/>
+    <text x="678" y="354" font-weight="700">Running processes</text>
+    <text x="678" y="373" class="muted">harness runs, python,</text>
+    <text x="678" y="390" class="muted">pytest on this Mac</text>
+  </g>
+</svg>
+<p style="margin:10px 0 0;font-size:14px;color:var(--muted)"><b style="color:var(--ink)">Top half:</b> each session has its own conversation, context, memory, task list and checkpoints.
+<b style="color:var(--ink)">Bottom box:</b> there's only one of each, and both sessions read and write it.</p>
+</div>
+
+<!-- ============ 2. Live vs stale ============ -->
+<h2>2 · The files are live, the memory of them is stale</h2>
+<div class="compare">
+  <div class="card">
+    <h3><span class="tag t-ok">live</span> The files</h3>
+    <p style="margin:0 0 10px">Like two developers on the same branch in the same folder. When NEW saves a file, OLD reads the new version the next time it opens it.</p>
+    <div class="mini">nirvanav0/   one branch, one checkout
+  NEW saves inbox.py
+  OLD opens inbox.py  → sees NEW's version</div>
+  </div>
+  <div class="card">
+    <h3><span class="tag t-old">stale</span> What each session remembers</h3>
+    <p style="margin:0 0 10px">What a session read an hour ago stays in its context. It answers and edits from that copy until it reads the file again.</p>
+    <div class="mini">OLD context:  inbox.py as of 14:19
+disk:         inbox.py as of 15:40
+→ re-read before editing or answering</div>
+  </div>
+</div>
+
+<!-- ============ 3. Your protocol ============ -->
+<h2>3 · Your protocol: split the files, tell each session what the other does</h2>
+<div class="card">
+<p style="margin-top:0">One session analyses and writes HTMLs, the other edits code. When both work on code they aim at different files, and each
+prompt says "an agent is working on X while you work on Y". It's the same model that kept the large workflows consistent: an owner per module, re-read before editing.</p>
+<table>
+  <tr><th>Risk</th><th>Covered by your protocol?</th></tr>
+  <tr><td>Two sessions writing the same file</td><td><span class="tag t-ok">yes</span> different files by design</td></tr>
+  <tr><td>Not knowing what the other session is doing</td><td><span class="tag t-ok">yes</span> stated in each prompt</td></tr>
+  <tr><td>Answering from a stale picture</td><td><span class="tag t-ok">mostly</span> the briefing + re-reading</td></tr>
+  <tr><td>Both picking the same next number (R75, PERF-15, migration 94, <code>b1_run9.log</code>)</td><td><span class="tag t-bad">no</span> scenario E</td></tr>
+  <tr><td>Things that aren't files: the DB, locks, processes</td><td><span class="tag t-bad">no</span> scenarios B, C</td></tr>
+  <tr><td><code>/rewind</code> in either session</td><td><span class="tag t-bad">no</span> scenario A</td></tr>
+</table>
+<p style="margin:14px 0 0">The "no" rows don't need anything written into logs or files. Each one is one more line in the prompt you already write.</p>
+</div>
+
+<!-- ============ 4. Scenarios ============ -->
+<h2>4 · What's left, step by step</h2>
+<p style="color:var(--muted);margin-top:0">Each row is a moment in time. All of these can happen with files cleanly split.</p>
+
+<div class="card scenario">
+  <div class="head"><span class="n">E</span><h3>Both sessions pick the same next number</h3></div>
+  <div class="lanes">
+    <div></div>
+    <div class="hdr t-old">OLD (benjr)</div>
+    <div class="hdr t-shared">shared docs</div>
+    <div class="hdr t-new">NEW (claude)</div>
+
+    <div class="time">copy</div>
+    <div class="ev old">knows: last appendix row is PERF-14</div>
+    <div class="ev shared">APPENDIX ends at PERF-14</div>
+    <div class="ev new">knows the same</div>
+
+    <div class="time">t1</div>
+    <div class="ev empty"></div>
+    <div class="ev shared">+ PERF-15: connection pool</div>
+    <div class="ev new">fixes <code>database_pool.py</code>, records PERF-15</div>
+
+    <div class="time">t2</div>
+    <div class="ev old">analysis ends in a decision, records "PERF-15" from memory</div>
+    <div class="ev bad">two different PERF-15 rows</div>
+    <div class="ev new">later cites PERF-15: which one?</div>
+  </div>
+  <div class="outcome">Both sessions share the same history, so they make the same "next" guess. The same goes for R-numbers in chapter 03, migration numbers in the 90–99 range, and scratch log names like <code>b1_run9.log</code>.
+  <b>Prompt line:</b> "you use R80+ and PERF-30+", or "only the code session writes the decision record and appendix".</div>
+</div>
+
+<div class="card scenario">
+  <div class="head"><span class="n">B</span><h3>The questions session kills a "hung" process that belongs to the code session</h3></div>
+  <div class="lanes">
+    <div></div>
+    <div class="hdr t-old">OLD (benjr)</div>
+    <div class="hdr t-shared">processes</div>
+    <div class="hdr t-new">NEW (claude)</div>
+
+    <div class="time">t1</div>
+    <div class="ev empty"></div>
+    <div class="ev shared"><code>run.py --block b1</code> pid 5001</div>
+    <div class="ev new">starts an acceptance run (~40 min)</div>
+
+    <div class="time">t2</div>
+    <div class="ev old">you: "why is b1 slow?" → it finds pid 5001, which it never started</div>
+    <div class="ev shared">pid 5001 quiet in a slow query</div>
+    <div class="ev new">waiting for the result</div>
+
+    <div class="time">t3</div>
+    <div class="ev old">"orphaned test process" → <code>kill 5001</code></div>
+    <div class="ev bad">pid 5001 killed</div>
+    <div class="ev new">run dies, 40 min lost</div>
+  </div>
+  <div class="outcome">This session did this for real on Oct 21 and Oct 22 (<code>kill 43380</code>). It was right then, but it can't tell whose process it is. Processes aren't files, so splitting the files doesn't help.
+  <b>Prompt line:</b> "don't kill processes or run the harness; NEW owns them".</div>
+</div>
+
+<div class="card scenario">
+  <div class="head"><span class="n">C</span><h3>Both run something against the same dev DB</h3></div>
+  <div class="lanes">
+    <div></div>
+    <div class="hdr t-old">OLD (benjr)</div>
+    <div class="hdr t-shared">nirvana_dev + Flotix lock</div>
+    <div class="hdr t-new">NEW (claude)</div>
+
+    <div class="time">t1</div>
+    <div class="ev empty"></div>
+    <div class="ev shared">lock on Flotix test numbers → NEW</div>
+    <div class="ev new">replays block b1</div>
+
+    <div class="time">t2</div>
+    <div class="ev old">to answer a question, runs a quick check that creates a test lead</div>
+    <div class="ev shared">OLD waits for the lock…</div>
+    <div class="ev new">running</div>
+
+    <div class="time">t3</div>
+    <div class="ev old">stuck, or creates rows in NEW's workspace</div>
+    <div class="ev bad">two writers, one workspace</div>
+    <div class="ev new">assertions fail on rows it didn't make</div>
+  </div>
+  <div class="outcome">This is the b1/b2 jam from Oct 21: one dead run kept the Flotix lock and b1 waited for hours.
+  <b>Prompt line:</b> "the DB is read-only for you; NEW runs tests".</div>
+</div>
+
+<div class="card scenario">
+  <div class="head"><span class="n">A</span><h3>A <code>/rewind</code> puts back files the session inherited from before the copy</h3></div>
+  <div class="lanes">
+    <div></div>
+    <div class="hdr t-old">OLD (benjr)</div>
+    <div class="hdr t-shared">shared files</div>
+    <div class="hdr t-new">NEW (claude)</div>
+
+    <div class="time">Oct 25</div>
+    <div class="ev old">checkpoints track <code>store.py</code> v4</div>
+    <div class="ev shared"><code>store.py</code> = v4</div>
+    <div class="ev new">same checkpoints, inherited</div>
+
+    <div class="time">t1</div>
+    <div class="ev empty"></div>
+    <div class="ev shared"><code>store.py</code> = v5</div>
+    <div class="ev new">edits <code>store.py</code></div>
+
+    <div class="time">t2</div>
+    <div class="ev old">undoes its last HTML edit with <code>/rewind</code></div>
+    <div class="ev bad"><code>store.py</code> back to v4</div>
+    <div class="ev new">still believes v5 is on disk</div>
+  </div>
+  <div class="outcome">Each checkpoint lists <b>every</b> file the session has tracked so far, so a rewind to any point, even after the copy, can put back the inherited ones.
+  Today that's 5 files: <code>run.py</code>, <code>store.py</code>, <code>profiling.py</code>, <code>resolutions.md</code> and one memory note. Code written by subagents isn't tracked.
+  <b>Prompt rule:</b> no <code>/rewind</code> in either session while both are active; undo by hand or with git.</div>
+</div>
+
+<!-- ============ 5. Summary ============ -->
+<h2>5 · The four prompt lines that close the gaps</h2>
+<div class="rules" style="grid-template-columns:repeat(4,1fr)">
+  <div class="rule"><b>Numbers</b>Separate ranges (R80+, PERF-30+), or one session owns the decision record, appendix and migrations.</div>
+  <div class="rule"><b>Non-file resources</b>One session runs the harness, tests and DB writes. The other never kills processes.</div>
+  <div class="rule"><b>Scratch</b>The questions session writes notes to <code>scratchpad/qa/</code>; its HTMLs go to <code>prompts/features/</code>.</div>
+  <div class="rule"><b>No /rewind</b>In either session while both are active.</div>
+</div>
+
+<p style="margin-top:36px;color:var(--muted);font-size:14px">Status on Oct 26: <code>revenue</code> (<code>cead6099…</code>) was copied to the <code>claude</code> account,
+together with the parent session's sidecars, so nothing points back to benjr. Resume with
+<code>cd ~/Documents/repos/nirvana/nirvanav0 &amp;&amp; claude --resume cead6099-542d-4242-b817-986289d7ee6f</code>.
+The benjr original is closed and can be reopened as the questions session.</p>
+
+</main>
+</body>
+</html>

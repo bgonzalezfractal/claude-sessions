@@ -25,6 +25,8 @@ while [ $# -gt 0 ]; do
 done
 RS=(rsync -a)
 [ "$DRY" = "--dry-run" ] && RS=(rsync -a --dry-run -v) && echo "*** DRY RUN ***"
+# A dry run must leave the destination untouched — not even empty dirs.
+mkd() { [ "$DRY" = "--dry-run" ] || mkdir -p "$@"; }
 
 SRC="${SRC%/}"; DST="${DST%/}"
 [ -d "$SRC" ] || { echo "no such src: $SRC" >&2; exit 1; }
@@ -116,7 +118,7 @@ if [ -f "$DST_T" ] && [ "$DRY" != "--dry-run" ]; then
 fi
 
 # ---- 1. transcript + per-session sidecar (subagents/, workflows/, tool-results/)
-mkdir -p "$DST/projects/$DST_KEY"
+mkd "$DST/projects/$DST_KEY"
 echo "[1/6] transcript + sidecar dirs"
 "${RS[@]}" "$TRANSCRIPT" "$DST/projects/$DST_KEY/"
 [ -d "$PROJ_DIR/$SID" ] && "${RS[@]}" "$PROJ_DIR/$SID/" "$DST/projects/$DST_KEY/$SID/"
@@ -131,7 +133,7 @@ for d in "$SRC"/projects/*/"$SID"; do
   k="$(basename "$(dirname "$d")")"
   [ "$k" = "$PROJ_KEY" ] && continue
   echo "      + extra sidecar under $k"
-  mkdir -p "$DST/projects/$k/$SID"
+  mkd "$DST/projects/$k/$SID"
   "${RS[@]}" "$d/" "$DST/projects/$k/$SID/"
   EXTRA_SIDECARS+=("$DST/projects/$k/$SID")
 done
@@ -176,7 +178,7 @@ fi
 # usually the richer one) — copy only the new files and merge the index lines.
 if [ -d "$PROJ_DIR/memory" ]; then
   echo "[2/6] project memory ($(ls "$PROJ_DIR/memory" | wc -l | tr -d ' ') files, additive)"
-  mkdir -p "$DST/projects/$DST_KEY/memory"
+  mkd "$DST/projects/$DST_KEY/memory"
   "${RS[@]}" --ignore-existing "$PROJ_DIR/memory/" "$DST/projects/$DST_KEY/memory/"
   if [ "$DRY" = "--dry-run" ]; then
     echo "      would merge MEMORY.md pointer lines"
@@ -209,7 +211,7 @@ fi
 echo "[3/6] tasks / file-history / session-env"
 for d in tasks file-history session-env; do
   if [ -d "$SRC/$d/$SID" ]; then
-    mkdir -p "$DST/$d/$SID"
+    mkd "$DST/$d/$SID"
     "${RS[@]}" "$SRC/$d/$SID/" "$DST/$d/$SID/"
     # a running source session leaves a .lock behind; it is meaningless in the copy
     [ "$DRY" = "--dry-run" ] || rm -f "$DST/$d/$SID/.lock"
@@ -262,8 +264,15 @@ KEEP=["allowedTools","mcpContextUris","mcpServers","enabledMcpjsonServers",
 tgt=d.setdefault("projects",{}).setdefault(dst_cwd,{})
 added=[]
 for k in KEEP:
-    if k in sp and k not in tgt:
+    if k not in sp: continue
+    if k not in tgt:
         tgt[k]=sp[k]; added.append(k)
+    # A dict key that already exists (often an empty mcpServers: {}) still gets
+    # the source's missing entries — existing destination entries win.
+    elif isinstance(sp[k],dict) and isinstance(tgt[k],dict):
+        new=[n for n in sp[k] if n not in tgt[k]]
+        for n in new: tgt[k][n]=sp[k][n]
+        added += [f"{k}.{n}" for n in new]
 shutil.copy2(dst,dst+".bak")
 json.dump(d,open(dst,"w"),indent=2)
 print("      merged keys:", ", ".join(added) or "(nothing new)")
