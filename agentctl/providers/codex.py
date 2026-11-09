@@ -9,6 +9,9 @@ Verified live 2026-09-14 against codex-cli 0.154.0:
     access token + `ChatGPT-Account-Id` header. Read-only, anchors nothing.
     rate_limit.primary_window = the 5 h session window (limit_window_seconds
     18000, used_percent, reset_at epoch), secondary_window = the weekly one.
+    NOT on the free plan (seen 2026-11-07): there primary_window is a single
+    30-day window (2592000 s) and there is no 5 h window at all — so the kind
+    is decided by the window's length, never by its slot.
     The same numbers are also written into every session's rollout file as
     `token_count` events (payload.info.rate_limits.primary/secondary with
     resets_at epoch) — the offline fallback when the token is stale.
@@ -28,7 +31,12 @@ Verified live 2026-09-14 against codex-cli 0.154.0:
     confirmed against the transcript, and a stuck session needs a keystroke in
     its own terminal; nothing external can unstick it.
   * Cheapest window-opening request: `codex exec --ephemeral
-    --skip-git-repo-check -s read-only -C ~ "Hello, only answer hello"`.
+    --skip-git-repo-check -s read-only -C ~ -m gpt-6-luna
+    -c model_reasoning_effort="low" "Hello, only answer hello"`. The model is
+    pinned: the user's config.toml model may be one a ChatGPT login rejects
+    ("'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT
+    account", 2026-11-07), which failed every ping. $CODEX_ANCHOR_MODEL
+    overrides it; the account's models_cache.json lists what it accepts.
   * Limit banner text: "You've hit your usage limit ... try again at 3:28 AM."
 """
 import glob, json, os, re, sqlite3, subprocess, time
@@ -39,6 +47,9 @@ HOME = os.path.expanduser("~")
 CODEX_BIN = os.environ.get("CODEX_BIN", "/opt/homebrew/bin/codex")
 USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 ANCHOR_PROMPT = "Hello, only answer hello"
+ANCHOR_MODEL = os.environ.get("CODEX_ANCHOR_MODEL", "gpt-6-luna")
+SESSION_MAX_MINUTES = 6 * 60       # a window this short or shorter is the 5 h one
+WEEK_MAX_MINUTES = 8 * 24 * 60
 LIMIT_RE = re.compile(r"hit your usage limit|rate limit(?:ed| reached)|usage limit", re.I)
 
 
@@ -98,10 +109,20 @@ def _iso(epoch):
     return datetime.fromtimestamp(int(epoch), timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _kind(mins, slot_kind):
+    """The window's kind from its length; the slot only decides when unknown."""
+    if not mins:
+        return slot_kind
+    if mins <= SESSION_MAX_MINUTES:
+        return "session"
+    return "weekly_all" if mins <= WEEK_MAX_MINUTES else "period"
+
+
 def _window(kind, w, limit_reached=False):
     pct = int(round(w.get("used_percent") or 0))
     secs = w.get("limit_window_seconds")
     mins = int(secs / 60) if secs else w.get("window_minutes")
+    kind = _kind(mins, kind)
     return {"kind": kind, "percent": pct,
             "resets_at": _iso(w.get("reset_at") or w.get("resets_at")),
             "is_active": bool(pct >= 100 and (limit_reached or kind == "session")),
@@ -383,10 +404,11 @@ def _wait_for_rollout_text(account, name, text, seconds=45):
 def anchor_ping(account, cwd=None, timeout=240):
     """Throwaway `codex exec` that opens the window; never touches a session."""
     cmd = _cmd(account, "exec", "--ephemeral", "--skip-git-repo-check",
-               "-s", "read-only", "-C", HOME, ANCHOR_PROMPT)
+               "-s", "read-only", "-C", HOME, "-m", ANCHOR_MODEL,
+               "-c", 'model_reasoning_effort="low"', ANCHOR_PROMPT)
     try:
         r = subprocess.run(cmd, env=env(account), cwd=HOME, capture_output=True,
-                           text=True, timeout=timeout)
+                           stdin=subprocess.DEVNULL, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         return "failed", "anchor ping timed out"
     except OSError as e:

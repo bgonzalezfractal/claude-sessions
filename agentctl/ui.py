@@ -361,6 +361,7 @@ function fmtReset(iso){if(!iso)return"";const d=new Date(iso),n=new Date();
   return"resets "+(d.toDateString()===n.toDateString()?"":d.toLocaleDateString([],{weekday:"short"})+" ")+t}
 function limLabel(l){if(l.kind==="session")return"session (5h)";
   if(l.kind==="weekly_all")return"weekly";
+  if(l.kind==="period"&&l.window_minutes)return Math.round(l.window_minutes/1440)+"-day";
   return"weekly "+(((l.scope||{}).model||{}).display_name||(l.kind==="weekly_scoped"?"scoped":l.kind))}
 function limRow(l){return`<div class="lim"><span class="lab">${limLabel(l)}</span>
   <span class="bar"><i style="width:${Math.min(100,l.percent||0)}%;

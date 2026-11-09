@@ -85,6 +85,8 @@ def limit_label(l):
     if kind == "weekly_scoped":
         scope = ((l.get("scope") or {}).get("model") or {}).get("display_name")
         return f"weekly {scope}" if scope else "weekly Fable"
+    if kind == "period" and l.get("window_minutes"):
+        return f"{round(l['window_minutes'] / 1440)}-day"
     return kind or "?"
 
 

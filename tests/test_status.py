@@ -58,6 +58,22 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(w['resets_at'], '2026-09-14T06:28:48Z')
 
 
+    def test_codex_kind_comes_from_window_length_not_slot(self):
+        # Free plan: primary_window is 30 days, there is no 5 h window.
+        w = X._window('session', {'used_percent': 3, 'limit_window_seconds': 2592000,
+                                  'reset_at': 1789367328})
+        self.assertEqual(w['kind'], 'period')
+        self.assertEqual(S.limit_label(w), '30-day')
+        week = X._window('session', {'used_percent': 1, 'limit_window_seconds': 604800})
+        self.assertEqual(week['kind'], 'weekly_all')
+        self.assertEqual(X._window('weekly_all', {'used_percent': 1})['kind'], 'weekly_all')
+
+    def test_codex_free_plan_has_no_session_window(self):
+        u = {'email': 'e', 'limits': [X._window('session', {
+            'used_percent': 3, 'limit_window_seconds': 2592000, 'reset_at': 1789367328})]}
+        with patch.object(X, 'usage', lambda acct: u):
+            self.assertEqual(X.session_reset_at({}), (None, 'no session limit in response'))
+
 if __name__ == '__main__':
     unittest.main()
 

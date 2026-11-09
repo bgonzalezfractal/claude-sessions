@@ -21,7 +21,10 @@ daemon) for the minute their current window actually expires. One extra ping
 per account per run, and no window is left unanchored during the day.
 
 Accounts whose window expires after --until (22:00 by default) are left alone;
-anchoring a window at 3 AM only burns weekly quota.
+anchoring a window at 3 AM only burns weekly quota. So is any "window" that
+ends more than 5 hours out: that is not a session window at all (Codex free
+reported its 30-day window as one on 2026-11-07 and got a catch-up 11 days
+out).
 """
 import argparse
 import os
@@ -36,6 +39,7 @@ from agentctl import renew                              # noqa: E402
 from agentctl.providers import discover_accounts, provider_of   # noqa: E402
 
 LEAD_MINUTES = 1          # fire just after the window expires, not exactly on it
+SESSION_WINDOW = timedelta(hours=5, minutes=5)   # longest a session window can have left
 
 
 def parse_until(text):
@@ -55,8 +59,11 @@ def window_state(account):
         return None, f"could not read usage ({e})"
     if not reset_at:
         return None, info
-    if reset_at <= datetime.now():
+    now = datetime.now()
+    if reset_at <= now:
         return None, "window already expired"
+    if reset_at - now > SESSION_WINDOW:
+        return None, f"window ends {reset_at:%a %d %b %H:%M} — not a 5 h session window"
     return reset_at, info
 
 
@@ -102,9 +109,10 @@ def main(argv=None):
     rc = run_pings([])
 
     queued = False
+    cutoff = datetime.combine(datetime.now().date(), a.until)
     for account, open_until, note in mid_window:
         at = open_until + timedelta(minutes=LEAD_MINUTES)
-        if at.time() > a.until and at.date() == datetime.now().date():
+        if at > cutoff:             # incl. after midnight: no overnight anchors
             print(f"{account['label']}: mid-window until {open_until:%H:%M} — "
                   f"after {a.until:%H:%M}, not queuing a catch-up")
             continue

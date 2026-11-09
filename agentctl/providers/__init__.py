@@ -21,11 +21,12 @@ Every provider module exposes these functions (duck-typed, no base class):
     usage(account, interactive=False) -> dict
         Read-only limit check that never anchors a usage window.
         {"email": str,
-         "limits": [{"kind": "session"|"weekly_all"|"weekly_scoped",
+         "limits": [{"kind": "session"|"weekly_all"|"weekly_scoped"|"period",
                      "percent": int, "resets_at": ISO-8601 str|None,
                      "reset_text": str (only when resets_at is unknown),
                      "is_active": bool, "window_minutes": int|None,
                      "scope": {...} (weekly_scoped only)}],
+                     # "period": any other length (Codex free = 30 days)
          "source": "api"|"tui"|"rollout",   # where the numbers came from
          "refreshed": bool, "retries": int, # optional notes
          "error": str}                       # present => nothing else usable

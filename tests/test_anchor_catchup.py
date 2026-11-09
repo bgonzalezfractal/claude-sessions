@@ -79,6 +79,19 @@ class CatchUpTests(unittest.TestCase):
         self.run_anchor([BUSY], {"default": (late, "10% used")})
         self.assertEqual(self.scheduled, [])
 
+    def test_window_longer_than_a_session_is_not_queued(self):
+        # Codex free plan: its only window is 30 days long (2026-11-07).
+        far = datetime.now() + timedelta(days=9)
+        self.run_anchor([BUSY], {"default": (far, "3% used")})
+        self.assertEqual(self.scheduled, [])
+
+    def test_catch_up_past_midnight_is_skipped(self):
+        tomorrow = datetime.now().replace(hour=0, minute=30, second=0,
+                                          microsecond=0) + timedelta(days=1)
+        with patch.object(anchor, "SESSION_WINDOW", timedelta(days=2)):
+            self.run_anchor([BUSY], {"default": (tomorrow, "10% used")})
+        self.assertEqual(self.scheduled, [])
+
     def test_no_catch_up_flag_skips_the_usage_reads(self):
         called = []
         with patch.object(anchor, "discover_accounts", lambda: called.append(1) or []), \

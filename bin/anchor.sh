@@ -19,6 +19,9 @@ LOCK="$HOME/.agentctl/anchor.lock"
 CLAUDE_BIN="${CLAUDE_BIN:-/opt/homebrew/bin/claude}"
 CODEX_BIN="${CODEX_BIN:-/opt/homebrew/bin/codex}"
 PROMPT='Hello, only answer hello'
+# Pinned: the user's config.toml model may be one a ChatGPT login rejects
+# (model_not_found), which failed every codex ping until 2026-11-09.
+CODEX_MODEL="${CODEX_ANCHOR_MODEL:-gpt-6-luna}"
 MAXBYTES=51200                      # rotate the log past 50 KB
 
 # --------------------------------------------------------------- accounts ---
@@ -58,9 +61,9 @@ ping_cmd() {
         fi
     else
         if [[ "$label" == codex ]]; then
-            CMD=(env -u CODEX_HOME "$CODEX_BIN" exec --ephemeral --skip-git-repo-check -s read-only -C "$HOME" "$PROMPT")
+            CMD=(env -u CODEX_HOME "$CODEX_BIN" exec --ephemeral --skip-git-repo-check -s read-only -C "$HOME" -m "$CODEX_MODEL" -c 'model_reasoning_effort="low"' "$PROMPT")
         else
-            CMD=(env CODEX_HOME="$dir" "$CODEX_BIN" exec --ephemeral --skip-git-repo-check -s read-only -C "$HOME" "$PROMPT")
+            CMD=(env CODEX_HOME="$dir" "$CODEX_BIN" exec --ephemeral --skip-git-repo-check -s read-only -C "$HOME" -m "$CODEX_MODEL" -c 'model_reasoning_effort="low"' "$PROMPT")
         fi
     fi
 }
@@ -123,7 +126,7 @@ for entry in "${ACCOUNTS[@]}"; do
     fi
     ping_cmd "$provider" "$label" "$dir"
     for attempt in 1 2 3; do
-        "${CMD[@]}" > "$RUN_TMP/output" 2>&1 &
+        "${CMD[@]}" < /dev/null > "$RUN_TMP/output" 2>&1 &
         ping_pid=$!
         ( sleep 90 &
           alarm_pid=$!

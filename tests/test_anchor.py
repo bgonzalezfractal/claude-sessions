@@ -47,6 +47,8 @@ class AnchorTests(unittest.TestCase):
             args = (home / 'codex-args').read_text()
             self.assertIn('codex-args: exec', args)
             self.assertIn('--ephemeral', args)
+            # Pinned model: the config.toml one may be rejected for ChatGPT logins.
+            self.assertIn('-m gpt-6-luna', args)
             self.assertFalse((home / '.agentctl/anchor.lock').exists())
 
             claude.write_text('#!/bin/zsh\nprint hello\n')
