@@ -79,11 +79,22 @@ LaunchAgent) and cleans up the pre-rename `claude-*` symlinks, the legacy
 `claude-status` alias in `~/.zshrc` (backed up to `~/.zshrc.agentctl.bak`).
 Re-run it after editing `bin/anchor.sh` — launchd uses the installed copy.
 
+To upgrade a machine later:
+
+```bash
+agentctl update            # fast-forward the clone; re-runs install.sh if needed
+agentctl update --check    # just say whether there is something to pull
+```
+
+`agentctl` is a symlink into the clone, so pulling is the upgrade; `install.sh`
+re-runs only when `install.sh` or `bin/anchor.sh` changed. It refuses a clone
+with uncommitted edits or unpushed commits.
+
 ## Layout
 
 - `agentctl/` — the package (stdlib only)
   - `cli.py` — `agentctl <command>` dispatcher; every command is a module with `main(argv) -> int`
-  - `status.py`, `renew.py`, `accounts.py`, `copy.py`, `log.py`, `ui.py`, `anchor.py` — one module per subcommand
+  - `status.py`, `renew.py`, `accounts.py`, `copy.py`, `log.py`, `ui.py`, `anchor.py`, `update.py` — one module per subcommand
   - `providers/claude.py`, `providers/codex.py` — everything provider-specific, behind the contract in `providers/__init__.py`
 - `bin/agentctl` — the dispatcher symlinked into `/opt/homebrew/bin`
 - `bin/anchor.sh` — the morning anchor script (zsh); `~/.agentctl/anchor.sh` is

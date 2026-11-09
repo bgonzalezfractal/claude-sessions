@@ -9,6 +9,7 @@ COMMANDS = [
     ("log",      "agentctl.log",      "one chronological stream of everything agentctl did"),
     ("ui",       "agentctl.ui",       "localhost dashboard"),
     ("anchor",   "agentctl.anchor",   "run the morning window-anchor pings now"),
+    ("update",   "agentctl.update",   "pull the latest agentctl into this machine's clone"),
 ]
 
 
